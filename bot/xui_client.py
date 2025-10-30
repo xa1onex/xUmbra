@@ -117,26 +117,39 @@ class XUIClient:
                 break
         if not chosen:
             raise RuntimeError('Не найден inbound для формирования ссылки')
-        port=chosen.get('port') or 'PORT'
+        port = chosen.get('port') or 'PORT'
         stream_settings = json.loads(chosen.get('streamSettings', '{}'))
         reality_settings = stream_settings.get('realitySettings') or {}
+        
+        # Извлекаем параметры REALITY
         pbk = ''
         sid = ''
         sni = 'google.com'
         if reality_settings:
-            pbk = reality_settings.get('settings', {}).get('publicKey','')
-            sid = reality_settings.get('shortId') or ''
-
-        # Формируем ссылку vless
-        link = f"vless://{client_uuid}@{self.cfg.base_url.split('//')[-1].split(':')[0]}:{port}/?type=tcp&security=reality&flow=xtls-rprx-vision"
+            pbk = reality_settings.get('settings', {}).get('publicKey', '')
+            sid = reality_settings.get('shortId', '')
+            sni = reality_settings.get('serverNames', [])
+            if isinstance(sni, list) and len(sni) > 0:
+                sni = sni[0]
+            elif not sni or sni == []:
+                sni = 'google.com'
+        
+        # Получаем IP сервера из настроек inbound или из base_url
+        server_ip = chosen.get('listen') or ''
+        if not server_ip or server_ip == '0.0.0.0' or server_ip == '':
+            # Берем IP из base_url
+            server_ip = self.cfg.base_url.split('//')[-1].split(':')[0]
+        
+        # Формируем ссылку vless в правильном порядке параметров
+        link = f"vless://{client_uuid}@{server_ip}:{port}/?type=tcp&encryption=none&security=reality"
         if pbk:
-            link+=f"&pbk={pbk}"
-        link+="&fp=chrome"
-        link+=f"&sni={sni}"
+            link += f"&pbk={pbk}"
+        link += "&fp=chrome"
+        link += f"&sni={sni}"
         if sid:
-            link+=f"&sid={sid}"
-        link+="&spx=%2F"
-        link+=f"#tg-{telegram_user_id}"
+            link += f"&sid={sid}"
+        link += "&spx=%2F&flow=xtls-rprx-vision"
+        link += f"#{display_name or email.split('@')[0]}"
 
         return {
             "email": email,
