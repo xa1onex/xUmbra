@@ -90,6 +90,7 @@ class XUIClient:
             "enable": True,
             "tgId": email,
             "subId": "",
+            "flow": "xtls-rprx-vision",
         }
         inbound_id = self.cfg.inbound_id
         payload = {
@@ -127,7 +128,7 @@ class XUIClient:
             sid = reality_settings.get('shortId') or ''
 
         # Формируем ссылку vless
-        link = f"vless://{client_uuid}@{self.cfg.base_url.split('//')[-1].split(':')[0]}:{port}/?type=tcp&security=reality"
+        link = f"vless://{client_uuid}@{self.cfg.base_url.split('//')[-1].split(':')[0]}:{port}/?type=tcp&security=reality&flow=xtls-rprx-vision"
         if pbk:
             link+=f"&pbk={pbk}"
         link+="&fp=chrome"
