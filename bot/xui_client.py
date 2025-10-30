@@ -73,81 +73,76 @@ class XUIClient:
     ) -> dict[str, Any]:
         self.ensure_login()
 
-        now_ms = int(time.time() * 1000)
-        expiry_ms = now_ms + (days_valid or 0) * 24 * 3600 * 1000
+        import datetime
+        now_dt = datetime.datetime.now()
+        expiry_time = int(now_dt.timestamp() * 1000) + (86400000 * (days_valid or 30))
         client_uuid = str(uuid.uuid4())
         email = f"tg_{telegram_user_id}_{int(time.time())}@xui"
-        vless_client = VlessClient(
-            id=client_uuid,
-            email=email,
-            flow="",  # set if you use REALITY/XTLS flow
-            limit_ip=0,
-            total_gb=traffic_gb or 0,
-            expiry_time_unix_ms=expiry_ms if days_valid else 0,
-        )
 
-        # Common 3x-ui API pattern for adding a client
-        # POST /panel/inbound/addClient or /xui/inbound/addClient
-        # Some panels expect form data, others JSON.
-        payload = {
-            "id": self.cfg.inbound_id,
-            "settings": json.dumps({"clients": [vless_client.to_3xui_json()]}),
+        # Формируем клиента как в вашем рабочем скрипте
+        client_dict = {
+            "id": client_uuid,
+            "email": email,
+            "alterId": 64,  # default for vless (можно поменять)
+            "limitIp": 3,    # примерная квота (можно поменять)
+            "totalGB": (traffic_gb or 0) * 1073741824 if traffic_gb != 0 else 0,
+            "expiryTime": expiry_time,
+            "enable": True,
+            "tgId": email,
+            "subId": "",
         }
-
-        # Try main endpoints and follow redirects manually
-        endpoints = [
-            "/panel/inbound/addClient",
-            "/panel/inbound/addClient/",
-            "/xui/inbound/addClient",
-            "/xui/inbound/addClient/",
-            "/api/panel/inbound/addClient",
-            "/api/panel/inbound/addClient/",
-            "/api/xui/inbound/addClient",
-            "/api/xui/inbound/addClient/",
-        ]
-        resp = None
-        for endpoint in endpoints:
-            print(f"[xui] Try endpoint: {endpoint}")
-            resp = self._client.post(
-                endpoint,
-                headers={"Content-Type": "application/json", **self._auth_headers()},
-                json=payload,
-                follow_redirects=False,
-            )
-            print(f"[xui] Endpoint: {endpoint} got {resp.status_code}")
-            if resp.status_code in (200, 201):
-                break
-            if resp.status_code in (301, 302) and "location" in resp.headers:
-                # try redirect manually
-                redir_url = resp.headers["location"]
-                print(f"[xui] Redirecting to {redir_url}")
-                resp = self._client.post(
-                    redir_url,
-                    headers={"Content-Type": "application/json", **self._auth_headers()},
-                    json=payload,
-                    follow_redirects=False,
-                )
-                print(f"[xui] Manual redirect response: {resp.status_code}")
-                if resp.status_code in (200, 201):
-                    break
-        else:
-            raise RuntimeError(f"addClient failed: {resp.status_code if resp else 'no response'} {resp.text if resp else ''}")
-
-        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else None
-        if data and not data.get("success", True):
+        inbound_id = self.cfg.inbound_id
+        payload = {
+            "id": inbound_id,
+            "settings": json.dumps({"clients": [client_dict]})
+        }
+        headers = {"Content-Type": "application/json", **self._auth_headers()}
+        endpoint = "/panel/api/inbounds/addClient"
+        print(f"[xui] POST {endpoint} payload: {payload}")
+        resp = self._client.post(endpoint, json=payload, headers=headers)
+        print(f"[xui] Status={resp.status_code} Response={resp.text}")
+        if resp.status_code != 200:
+            raise RuntimeError(f"addClient failed: {resp.status_code} {resp.text}")
+        data = resp.json()
+        if not data.get("success", True):
             raise RuntimeError(f"addClient error: {data}")
 
-        # Build VLESS link (basic form; adjust for your REALITY/WS/GRPC params)
-        # Example: vless://<uuid>@host:port?encryption=none&security=none&type=tcp#name
-        # For REALITY/XTLS-vision etc., you need to fill params accordingly.
-        vless_link = f"vless://{client_uuid}@YOUR_HOST:YOUR_PORT?encryption=none&security=none&type=tcp#{display_name}"
+        # Теперь получим данные inbound через лист (для формирования корректной ссылки)
+        inbs = self._client.get("/panel/api/inbounds/list").json().get("obj", [])
+        chosen=None
+        for i in inbs:
+            if i.get('id') == inbound_id:
+                chosen=i
+                break
+        if not chosen:
+            raise RuntimeError('Не найден inbound для формирования ссылки')
+        port=chosen.get('port') or 'PORT'
+        stream_settings = json.loads(chosen.get('streamSettings', '{}'))
+        reality_settings = stream_settings.get('realitySettings') or {}
+        pbk = ''
+        sid = ''
+        sni = 'google.com'
+        if reality_settings:
+            pbk = reality_settings.get('settings', {}).get('publicKey','')
+            sid = reality_settings.get('shortId') or ''
+
+        # Формируем ссылку vless
+        link = f"vless://{client_uuid}@{self.cfg.base_url.split('//')[-1].split(':')[0]}:{port}/?type=tcp&security=reality"
+        if pbk:
+            link+=f"&pbk={pbk}"
+        link+="&fp=chrome"
+        link+=f"&sni={sni}"
+        if sid:
+            link+=f"&sid={sid}"
+        link+="&spx=%2F"
+        link+=f"#tg-{telegram_user_id}"
 
         return {
             "email": email,
             "id": client_uuid,
-            "expires_ms": expiry_ms if days_valid else 0,
+            "expires_ms": expiry_time,
             "traffic_gb": traffic_gb or 0,
-            "link": vless_link,
+            "link": link,
         }
 
 
