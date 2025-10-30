@@ -94,22 +94,44 @@ class XUIClient:
             "settings": json.dumps({"clients": [vless_client.to_3xui_json()]}),
         }
 
-        # Try JSON first
-        resp = self._client.post(
+        # Try main endpoints and follow redirects manually
+        endpoints = [
             "/panel/inbound/addClient",
-            headers={"Content-Type": "application/json", **self._auth_headers()},
-            json=payload,
-        )
-        if resp.status_code == 404:
-            # Try alternative path used by some x-ui forks
+            "/panel/inbound/addClient/",
+            "/xui/inbound/addClient",
+            "/xui/inbound/addClient/",
+            "/api/panel/inbound/addClient",
+            "/api/panel/inbound/addClient/",
+            "/api/xui/inbound/addClient",
+            "/api/xui/inbound/addClient/",
+        ]
+        resp = None
+        for endpoint in endpoints:
+            print(f"[xui] Try endpoint: {endpoint}")
             resp = self._client.post(
-                "/xui/inbound/addClient",
-                headers={**self._auth_headers()},
-                data=payload,
+                endpoint,
+                headers={"Content-Type": "application/json", **self._auth_headers()},
+                json=payload,
+                follow_redirects=False,
             )
-
-        if resp.status_code != 200:
-            raise RuntimeError(f"addClient failed: {resp.status_code} {resp.text}")
+            print(f"[xui] Endpoint: {endpoint} got {resp.status_code}")
+            if resp.status_code in (200, 201):
+                break
+            if resp.status_code in (301, 302) and "location" in resp.headers:
+                # try redirect manually
+                redir_url = resp.headers["location"]
+                print(f"[xui] Redirecting to {redir_url}")
+                resp = self._client.post(
+                    redir_url,
+                    headers={"Content-Type": "application/json", **self._auth_headers()},
+                    json=payload,
+                    follow_redirects=False,
+                )
+                print(f"[xui] Manual redirect response: {resp.status_code}")
+                if resp.status_code in (200, 201):
+                    break
+        else:
+            raise RuntimeError(f"addClient failed: {resp.status_code if resp else 'no response'} {resp.text if resp else ''}")
 
         data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else None
         if data and not data.get("success", True):
