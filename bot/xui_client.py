@@ -146,8 +146,7 @@ class XUIClient:
             link += f"&pbk={pbk}"
         link += "&fp=chrome"
         link += f"&sni={sni}"
-        if sid:
-            link += f"&sid={sid}"
+        link += f"&sid={sid if sid else '3d'}"
         link += "&spx=%2F&flow=xtls-rprx-vision"
         link += f"#{display_name or email.split('@')[0]}"
 
