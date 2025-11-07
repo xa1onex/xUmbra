@@ -101,7 +101,7 @@ PAYMENT_METHODS = {
     },
     "yookassa": {
         "title": "Юкасса",
-        "provider_token": os.getenv("YOOKASSA_TOKEN", ""),
+        "provider_token": "381764678:TEST:150431",
         "currency": "RUB"
     }
 }
