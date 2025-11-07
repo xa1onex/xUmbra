@@ -26,20 +26,8 @@ class PaymentStates(StatesGroup):
 
 @asynccontextmanager
 async def lifespan(dp: Dispatcher):
-    # Initialize database and services
-    cfg = dp["config"]
-    db = Database(cfg.database.db_path)
-    xui = XUIClient(cfg.xui)
-    sub_service = SubscriptionService(db, xui)
-    
-    dp["db"] = db
-    dp["xui"] = xui
-    dp["sub_service"] = sub_service
-    
+    # Cleanup on shutdown if needed
     yield
-    
-    # Cleanup if needed
-    pass
 
 
 def get_main_keyboard() -> ReplyKeyboardMarkup:
@@ -89,6 +77,15 @@ def create_dp(cfg) -> Dispatcher:
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage, lifespan=lifespan)
     dp["config"] = cfg
+    
+    # Initialize database and services BEFORE registering handlers
+    db = Database(cfg.database.db_path)
+    xui = XUIClient(cfg.xui)
+    sub_service = SubscriptionService(db, xui)
+    
+    dp["db"] = db
+    dp["xui"] = xui
+    dp["sub_service"] = sub_service
 
     @dp.message(CommandStart())
     async def on_start(msg: Message, state: FSMContext):
