@@ -1,497 +1,696 @@
+import os
 import asyncio
+import secrets
 import logging
-from contextlib import asynccontextmanager
-from typing import Optional
+from datetime import datetime, timedelta
+from urllib.parse import quote
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, PreCheckoutQuery, LabeledPrice
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import pytz
 
 from .config import load_config
 from .xui_client import XUIClient
-from .database import Database
-from .subscription_service import SubscriptionService, SubscriptionPlan
+from .database import init_db, get_connection, check_expired_subscriptions
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+# Планы подписки
+SUBSCRIPTION_PLANS = {
+    "1_month": {
+        "title": "1 месяц",
+        "duration": 1,
+        "traffic_gb": 100,
+        "price_rub": 19900,  # 199₽
+        "price_stars": 199,
+        "new_user": True
+    },
+    "3_months": {
+        "title": "3 месяца",
+        "duration": 3,
+        "traffic_gb": 300,
+        "price_rub": 49900,  # 499₽
+        "price_stars": 499,
+        "new_user": True
+    },
+    "6_months": {
+        "title": "6 месяцев",
+        "duration": 6,
+        "traffic_gb": 600,
+        "price_rub": 89900,  # 899₽
+        "price_stars": 899,
+        "new_user": True
+    },
+    "12_months": {
+        "title": "12 месяцев",
+        "duration": 12,
+        "traffic_gb": 1200,
+        "price_rub": 149900,  # 1499₽
+        "price_stars": 1499,
+        "new_user": True
+    }
+}
 
-class PaymentStates(StatesGroup):
-    waiting_amount = State()
-    waiting_payment_confirmation = State()
+RENEWAL_PLANS = {
+    "1_month_renew": {
+        "title": "1 месяц 🔥",
+        "duration": 1,
+        "traffic_gb": 100,
+        "price_rub": 14900,  # 149₽
+        "price_stars": 149,
+        "new_user": False
+    },
+    "3_months_renew": {
+        "title": "3 месяца 🔥",
+        "duration": 3,
+        "traffic_gb": 300,
+        "price_rub": 39900,  # 399₽
+        "price_stars": 399,
+        "new_user": False
+    },
+    "6_months_renew": {
+        "title": "6 месяцев 🔥",
+        "duration": 6,
+        "traffic_gb": 600,
+        "price_rub": 74900,  # 749₽
+        "price_stars": 749,
+        "new_user": False
+    },
+    "12_months_renew": {
+        "title": "12 месяцев 🔥",
+        "duration": 12,
+        "traffic_gb": 1200,
+        "price_rub": 119900,  # 1199₽
+        "price_stars": 1199,
+        "new_user": False
+    }
+}
 
+# Методы оплаты
+PAYMENT_METHODS = {
+    "stars": {
+        "title": "Telegram Stars",
+        "provider_token": "",
+        "currency": "XTR"
+    },
+    "yookassa": {
+        "title": "Юкасса",
+        "provider_token": os.getenv("YOOKASSA_TOKEN", ""),
+        "currency": "RUB"
+    }
+}
 
-@asynccontextmanager
-async def lifespan(dp: Dispatcher):
-    # Cleanup on shutdown if needed
-    yield
+POLICY_LINK = "https://telegra.ph/Konfidencialnost-i-usloviya-02-01"
 
+class SubscriptionSteps(StatesGroup):
+    CHOOSING_PLAN = State()
+    CHOOSING_PAYMENT_METHOD = State()
 
-def get_main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📦 Моя подписка"), KeyboardButton(text="💰 Баланс")],
-            [KeyboardButton(text="🛒 Купить подписку"), KeyboardButton(text="🎁 Инвайт")],
-            [KeyboardButton(text="📊 Статистика")],
-        ],
-        resize_keyboard=True,
+cfg = load_config()
+bot = Bot(token=cfg.bot.bot_token)
+dp = Dispatcher()
+xui_client = XUIClient(cfg.xui)
+
+init_db(cfg.database.db_path)
+
+def get_main_keyboard(user_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="💳 Premium", callback_data="open_premium"),
+        InlineKeyboardButton(text="🎁 Рефералка", callback_data="open_invite")
     )
-
-
-def get_plans_keyboard() -> InlineKeyboardMarkup:
-    plans = SubscriptionService.PLANS
-    buttons = []
-    for i, plan in enumerate(plans):
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"{plan.name} - {plan.price}₽",
-                callback_data=f"plan_{i}"
-            )
-        ])
-    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def get_subscription_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_sub")],
-            [InlineKeyboardButton(text="🛒 Купить подписку", callback_data="buy_sub")],
-        ]
+    builder.row(
+        InlineKeyboardButton(text="🆘 Помощь", callback_data="open_help")
     )
+    return builder.as_markup()
 
+@dp.message(CommandStart())
+async def handle_start(message: Message):
+    user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+    args = message.text.split()
 
-def get_payment_keyboard(payment_id: int, amount: float) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Подтвердить оплату", callback_data=f"confirm_pay_{payment_id}")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_payment")],
-        ]
-    )
+    # Парсим реферальный код
+    referral_code = args[1][4:] if len(args) > 1 and args[1].startswith('ref_') else None
 
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        user = cursor.fetchone()
 
-def create_dp(cfg) -> Dispatcher:
-    storage = MemoryStorage()
-    dp = Dispatcher(storage=storage, lifespan=lifespan)
-    dp["config"] = cfg
-    
-    # Initialize database and services BEFORE registering handlers
-    db = Database(cfg.database.db_path)
-    xui = XUIClient(cfg.xui)
-    sub_service = SubscriptionService(db, xui)
-    
-    dp["db"] = db
-    dp["xui"] = xui
-    dp["sub_service"] = sub_service
-
-    @dp.message(CommandStart())
-    async def on_start(msg: Message, state: FSMContext):
-        await state.clear()
-        args = msg.text.split()[1:] if len(msg.text.split()) > 1 else []
-        
-        db: Database = dp["db"]
-        user_id = msg.from_user.id
-        username = msg.from_user.username
-        # Get full name from first_name and last_name
-        full_name = (
-            f"{msg.from_user.first_name or ''} {msg.from_user.last_name or ''}".strip()
-            if msg.from_user.first_name or msg.from_user.last_name
-            else None
-        )
-        
-        # Check for invite code
-        referrer_id = None
-        if args:
-            invite_code = args[0]
-            # Try to use invite code
-            if db.use_invite_code(invite_code, user_id):
-                # Get referrer from invite
-                user = db.get_user(user_id)
-                if user and user.referrer_id:
-                    referrer_id = user.referrer_id
-                    # Add bonus to referrer
-                    db.update_user_balance(user.referrer_id, cfg.payment.referral_bonus)
-                    await msg.bot.send_message(
-                        user.referrer_id,
-                        f"🎉 Ваш реферал зарегистрировался! Вы получили {cfg.payment.referral_bonus}₽ бонуса."
-                    )
-        
-        # Get or create user
-        user = db.get_or_create_user(user_id, username, full_name, referrer_id)
-        
-        welcome_text = f"""👋 <b>Добро пожаловать в VPN бот!</b>
-
-🔐 Безопасный и быстрый VPN
-🌐 Обход блокировок
-⚡ Высокая скорость
-
-Используйте меню для управления подпиской."""
-        
-        if referrer_id:
-            welcome_text += f"\n\n🎁 Вы зарегистрировались по реферальной ссылке!"
-        
-        await msg.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
-
-    @dp.message(F.text == "📦 Моя подписка")
-    @dp.message(Command("subscription"))
-    async def on_subscription(msg: Message):
-        db: Database = dp["db"]
-        sub_service: SubscriptionService = dp["sub_service"]
-        
-        user_id = msg.from_user.id
-        info_text = sub_service.format_subscription_message(user_id)
-        
-        await msg.answer(
-            info_text,
-            reply_markup=get_subscription_keyboard(),
-            parse_mode="HTML"
-        )
-
-    @dp.message(F.text == "🛒 Купить подписку")
-    @dp.message(Command("buy"))
-    async def on_buy(msg: Message):
-        plans = SubscriptionService.PLANS
-        plans_text = "🛒 <b>Доступные тарифы:</b>\n\n"
-        for i, plan in enumerate(plans):
-            traffic_info = "♾️ Безлимит" if plan.traffic_gb == 0 else f"{plan.traffic_gb} ГБ"
-            plans_text += f"{i+1}. <b>{plan.name}</b>\n"
-            plans_text += f"   📊 Трафик: {traffic_info}\n"
-            plans_text += f"   ⏱ Срок: {plan.days} дней\n"
-            plans_text += f"   💰 Цена: {plan.price}₽\n\n"
-        
-        await msg.answer(
-            plans_text,
-            reply_markup=get_plans_keyboard(),
-            parse_mode="HTML"
-        )
-
-    @dp.callback_query(F.data.startswith("plan_"))
-    async def on_plan_selected(callback: CallbackQuery, state: FSMContext):
-        await callback.answer()
-        plan_index = int(callback.data.split("_")[1])
-        sub_service: SubscriptionService = dp["sub_service"]
-        db: Database = dp["db"]
-        
-        plan = sub_service.get_plan_by_index(plan_index)
-        if not plan:
-            await callback.message.answer("❌ План не найден")
-            return
-        
-        user_id = callback.from_user.id
-        user = db.get_user(user_id)
-        
         if not user:
-            await callback.message.answer("❌ Пользователь не найден")
-            return
-        
-        # Check if user has enough balance
-        if user.balance < plan.price:
-            needed = plan.price - user.balance
-            await callback.message.answer(
-                f"❌ Недостаточно средств на балансе.\n\n"
-                f"💰 Ваш баланс: {user.balance}₽\n"
-                f"💵 Нужно: {plan.price}₽\n"
-                f"💸 Не хватает: {needed}₽\n\n"
-                f"Пополните баланс через команду /balance или /payment",
-                parse_mode="HTML"
-            )
-            return
-        
-        # Check if user already has active subscription
-        active_sub = db.get_user_active_subscription(user_id)
-        if active_sub:
-            await callback.message.answer(
-                "❌ У вас уже есть активная подписка. Дождитесь её окончания или отмените текущую.",
-                parse_mode="HTML"
-            )
-            return
+            # Создаем нового пользователя
+            new_referral_code = secrets.token_hex(4)
+            cursor.execute('''
+                INSERT INTO users (
+                    user_id, 
+                    username, 
+                    first_name, 
+                    registration_date,
+                    last_activity,
+                    subscribed,
+                    referral_code,
+                    invited_by,
+                    pay_subscribed,
+                    subscription_end
+                ) VALUES (?, ?, ?, datetime('now'), datetime('now'), FALSE, ?, NULL, FALSE, NULL)
+            ''', (user_id, username, first_name, new_referral_code))
+            conn.commit()
 
-        # Create subscription
-        try:
-            subscription, vless_link = sub_service.create_subscription_for_user(
-                user_id=user_id,
-                plan=plan,
-                username=callback.from_user.username,
-            )
-            
-            # Deduct from balance
-            db.update_user_balance(user_id, -plan.price)
-            
-            # Create payment record
-            db.create_payment(
-                user_id=user_id,
-                amount=plan.price,
-                subscription_id=subscription.id,
-                payment_method="balance",
-            )
-            
-            success_text = f"""✅ <b>Подписка успешно активирована!</b>
+            # Обработка реферального кода
+            has_referral = False
+            if referral_code:
+                cursor.execute('SELECT user_id FROM users WHERE referral_code = ?', (referral_code,))
+                inviter = cursor.fetchone()
 
-📦 План: {plan.name}
-📊 Трафик: {"Безлимит" if plan.traffic_gb == 0 else f"{plan.traffic_gb} ГБ"}
-⏱ Срок: {plan.days} дней
-💰 Списано: {plan.price}₽
+                if inviter:
+                    inviter_id = inviter[0]
+                    # Обновляем данные пригласившего
+                    cursor.execute('''
+                        UPDATE users SET
+                            referral_count = referral_count + 1,
+                            subscription_end = CASE 
+                                WHEN subscription_end IS NULL OR subscription_end < DATE('now') 
+                                THEN DATE('now', '+5 days')
+                                ELSE DATE(subscription_end, '+5 days')
+                            END,
+                            pay_subscribed = 1
+                        WHERE user_id = ?
+                    ''', (inviter_id,))
 
-🔗 <b>Ваша VPN ссылка:</b>
-<code>{vless_link}</code>
+                    # Обновляем данные нового пользователя
+                    cursor.execute('''
+                        UPDATE users SET
+                            invited_by = ?,
+                            subscription_end = DATE('now', '+3 days'),
+                            pay_subscribed = 1
+                        WHERE user_id = ?
+                    ''', (inviter_id, user_id))
+                    conn.commit()
 
-📱 <b>Как использовать:</b>
-1. Скачайте приложение (v2rayNG, sing-box и т.п.)
-2. Импортируйте ссылку
-3. Подключитесь!
+                    # Уведомления
+                    try:
+                        await bot.send_message(
+                            inviter_id,
+                            f"🎉 Вы получили +5 дней VPN за приглашение друга!\n"
+                            f"Теперь ваш VPN активен до: {(datetime.now() + timedelta(days=5)).strftime('%d.%m.%Y')}"
+                        )
+                    except Exception as e:
+                        logging.error(f"Ошибка отправки уведомления: {e}")
 
-💡 Сохраните ссылку в безопасном месте."""
-            
-            await callback.message.answer(success_text, parse_mode="HTML")
-            
-        except Exception as e:
-            logger.exception("Failed to create subscription")
-            await callback.message.answer(
-                f"❌ Ошибка при создании подписки: {e}\n\nПопробуйте позже или свяжитесь с поддержкой."
-            )
+                    has_referral = True
 
-    @dp.message(F.text == "💰 Баланс")
-    @dp.message(Command("balance"))
-    async def on_balance(msg: Message):
-        db: Database = dp["db"]
-        user_id = msg.from_user.id
-        user = db.get_user(user_id)
-        
-        if not user:
-            await msg.answer("❌ Пользователь не найден")
-            return
+            # Формируем приветственное сообщение
+            welcome_msg_parts = [
+                "<b>VPN бот</b> — быстрый и надежный VPN сервис\n\n"
+            ]
 
-        balance_text = f"""💰 <b>Ваш баланс</b>
-
-💵 Текущий баланс: <b>{user.balance}₽</b>
-
-💡 Пополните баланс через команду /payment"""
-        
-        await msg.answer(balance_text, parse_mode="HTML")
-
-    @dp.message(Command("payment"))
-    async def on_payment(msg: Message, state: FSMContext):
-        await state.set_state(PaymentStates.waiting_amount)
-        await msg.answer(
-            "💳 <b>Пополнение баланса</b>\n\n"
-            "Введите сумму для пополнения (минимум 100₽):",
-            parse_mode="HTML"
-        )
-
-    @dp.message(PaymentStates.waiting_amount)
-    async def on_payment_amount(msg: Message, state: FSMContext):
-        try:
-            amount = float(msg.text)
-            if amount < dp["config"].payment.min_payment:
-                await msg.answer(
-                    f"❌ Минимальная сумма пополнения: {dp['config'].payment.min_payment}₽"
+            if has_referral:
+                expiration_date = (datetime.now() + timedelta(days=3)).strftime("%d.%m.%Y")
+                welcome_msg_parts.append(
+                    f"🎁 Вы получили +3 дня <b>VPN</b> за регистрацию по реферальной ссылке!\n"
+                    f"Ваш <b>VPN</b> активен до: {expiration_date}\n\n"
                 )
-                return
-            
-            db: Database = dp["db"]
-            payment = db.create_payment(
-                user_id=msg.from_user.id,
-                amount=amount,
-                payment_method="manual",
+
+            welcome_msg_parts.extend([
+                "<b>Бот предоставляет</b>:\n"
+                "• Безопасный и быстрый VPN\n"
+                "• Обход блокировок\n"
+                "• Высокая скорость\n\n"
+                "👉 Больше информации в разделе <b>помощь</b> - /help\n\n"
+                "‼️ Продолжая использовать бота, вы принимаете <a href='https://telegra.ph/Konfidencialnost-i-usloviya-02-01'>нашу политику и конфиденциальность</a>!\n\n"
+            ])
+
+            welcome_msg = "".join(welcome_msg_parts)
+
+            await message.answer(
+                welcome_msg,
+                reply_markup=get_main_keyboard(user_id),
+                disable_web_page_preview=True,
+                parse_mode='HTML'
             )
-            
-            payment_info = f"""💳 <b>Платеж создан</b>
+        else:
+            # Обновляем активность
+            cursor.execute("UPDATE users SET last_activity = datetime('now') WHERE user_id = ?", (user_id,))
+            conn.commit()
 
-💰 Сумма: {amount}₽
-🆔 ID платежа: {payment.id}
+            # Проверяем статус подписки
+            cursor.execute('''
+                SELECT subscription_end, pay_subscribed 
+                FROM users 
+                WHERE user_id = ?
+            ''', (user_id,))
+            user_data = cursor.fetchone()
+            
+            subscription_status = "неактивен"
+            if user_data and user_data[1] == 1 and user_data[0]:
+                end_date = datetime.strptime(user_data[0], "%Y-%m-%d")
+                if end_date >= datetime.now():
+                    subscription_status = f"активен до {end_date.strftime('%d.%m.%Y')}"
 
-⚠️ <b>ВНИМАНИЕ:</b>
-Для завершения платежа свяжитесь с администратором.
+            await message.answer(
+                f"👋 Рады видеть тебя снова, <b>{first_name}</b>!\n\n"
+                f"<b>VPN</b>: <i>{subscription_status}</i>\n\n"
+                f"📌 <b>Команды:</b>\n"
+                "<i>/start</i> - Перезагрузить бота\n"
+                "<i>/prem</i> - Покупка VPN\n"
+                "<i>/invite</i> - Пригласи друга\n\n"
+                "Используйте кнопки ниже для управления.",
+                parse_mode='HTML', 
+                reply_markup=get_main_keyboard(user_id)
+            )
 
-После подтверждения оплаты баланс будет пополнен автоматически."""
-            
-            await msg.answer(payment_info, parse_mode="HTML")
-            
-            # Notify admin
-            for admin_id in dp["config"].bot.admin_ids:
-                try:
-                    await msg.bot.send_message(
-                        admin_id,
-                        f"💳 Новый платеж:\n"
-                        f"👤 Пользователь: @{msg.from_user.username or msg.from_user.id}\n"
-                        f"🆔 ID: {msg.from_user.id}\n"
-                        f"💰 Сумма: {amount}₽\n"
-                        f"🆔 ID платежа: {payment.id}",
-                        reply_markup=get_payment_keyboard(payment.id, amount),
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to notify admin {admin_id}: {e}")
-            
-            await state.clear()
-            
-        except ValueError:
-            await msg.answer("❌ Неверный формат суммы. Введите число (например: 500)")
+@dp.message(Command("prem"))
+@dp.callback_query(F.data == "open_premium")
+async def handle_sub_info(message_or_callback: Message | CallbackQuery, state: FSMContext):
+    if isinstance(message_or_callback, CallbackQuery):
+        message = message_or_callback.message
+        await message_or_callback.answer()
+    else:
+        message = message_or_callback
+    
+    user_id = message.from_user.id
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT 
+                subscription_end,
+                julianday(subscription_end) - julianday('now') as days_remaining 
+            FROM users 
+            WHERE user_id = ? 
+                AND pay_subscribed = 1 
+                AND subscription_end >= DATE('now')
+        ''', (user_id,))
+        result = cursor.fetchone()
 
-    @dp.callback_query(F.data.startswith("confirm_pay_"))
-    async def on_confirm_payment(callback: CallbackQuery):
-        await callback.answer()
-        payment_id = int(callback.data.split("_")[2])
-        db: Database = dp["db"]
-        
-        # Get payment
-        with db.get_connection() as conn:
-            cursor = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,))
-            row = cursor.fetchone()
-            if not row:
-                await callback.message.answer("❌ Платеж не найден")
-                return
+    builder = InlineKeyboardBuilder()
+    text = "💳 <b>Информация о вашем VPN:</b>\n\n"
+
+    if result:
+        subscription_end, days_remaining = result
+        days_remaining = int(days_remaining)
+        end_date = datetime.strptime(subscription_end, "%Y-%m-%d").strftime("%d.%m.%Y")
+
+        if days_remaining <= 3:
+            text = (
+                "✅ Ваш <b>VPN</b> <b>активен</b>!\n\n"
+                f"Дата окончания: <i>{end_date}</i>\n\n"
+                "<b>Детали VPN</b>:\n"
+                "• Быстрый и безопасный VPN\n"
+                "• Обход всех блокировок\n"
+                "• Высокая скорость\n\n"
+                "🎁 <b>Специальное предложение!</b>\n\n"
+                "🔥 Успей продлить <b>VPN</b> по специальной цене:\n"
+                f"1 месяц <s>199₽</s> - 149₽\n"
+                f"3 месяца <s>499₽</s> - 399₽\n"
+                f"6 месяцев <s>899₽</s> - 749₽\n"
+                f"12 месяцев <s>1499₽</s> - 1199₽\n\n"
+                "Спасибо за использование <b>VPN</b>!"
+            )
+            for plan_id, plan_data in RENEWAL_PLANS.items():
+                builder.button(
+                    text=f"{plan_data['title']} - {plan_data['price_rub'] // 100}₽ | {plan_data['price_stars']}⭐",
+                    callback_data=f"plan:{plan_id}"
+                )
+        else:
+            text += (
+                "✅ Ваш <b>VPN</b> <b>активен</b>!\n\n"
+                f"Дата окончания: <i>{end_date}</i>\n\n"
+                "<b>Детали VPN</b>:\n"
+                "• Быстрый и безопасный VPN\n"
+                "• Обход всех блокировок\n"
+                "• Высокая скорость\n\n"
+                "Спасибо за использование <b>VPN</b>!"
+            )
+    else:
+        text += (
+            "❌ Ваш VPN <b>неактивен</b>!\n\n"
+            "Что ты получишь с <b>VPN</b>?\n"
+            "• Быстрый и безопасный VPN\n"
+            "• Обход всех блокировок\n"
+            "• Высокая скорость подключения\n"
+        )
+        for plan_id, plan_data in SUBSCRIPTION_PLANS.items():
+            builder.button(
+                text=f"{plan_data['title']} - {plan_data['price_rub'] // 100}₽ | {plan_data['price_stars']}⭐",
+                callback_data=f"plan:{plan_id}"
+            )
+
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
+    builder.adjust(1)
+
+    await message.answer(
+        text,
+        reply_markup=builder.as_markup(),
+        parse_mode="HTML"
+    )
+    await state.set_state(SubscriptionSteps.CHOOSING_PLAN)
+
+@dp.callback_query(SubscriptionSteps.CHOOSING_PLAN, F.data.startswith("plan:"))
+async def select_plan(callback: CallbackQuery, state: FSMContext):
+    plan_id = callback.data.split(":")[1]
+
+    ALL_PLANS = {**SUBSCRIPTION_PLANS, **RENEWAL_PLANS}
+
+    if plan_id not in ALL_PLANS:
+        await callback.answer("❌ Неверный план")
+        return
+
+    is_renewal = plan_id in RENEWAL_PLANS
+    plan_data = RENEWAL_PLANS[plan_id] if is_renewal else SUBSCRIPTION_PLANS[plan_id]
+
+    await state.update_data(
+        selected_plan_id=plan_id,
+        selected_plan_data=plan_data,
+        is_renewal=is_renewal
+    )
+
+    builder = InlineKeyboardBuilder()
+    for method_id, method_data in PAYMENT_METHODS.items():
+        builder.button(
+            text=method_data['title'],
+            callback_data=f"method:{method_id}"
+        )
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="sub_back_to_plan"))
+    builder.adjust(1)
+
+    # Форматируем цены для отображения
+    price_rub = plan_data['price_rub'] // 100
+    price_stars = plan_data['price_stars']
+
+    await callback.message.edit_text(
+        f"📝 Выбранный план: <i>{plan_data['title']}</i>\n"
+        f"💳 Сумма оплаты: <i>{price_rub}₽</i> или <i>{price_stars}⭐</i>\n\n"
+        "Выберите способ оплаты:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+
+    await state.set_state(SubscriptionSteps.CHOOSING_PAYMENT_METHOD)
+
+@dp.callback_query(SubscriptionSteps.CHOOSING_PAYMENT_METHOD, F.data.startswith("method:"))
+async def process_payment(callback: CallbackQuery, state: FSMContext):
+    method_id = callback.data.split(":")[1]
+    user_data = await state.get_data()
+    plan_id = user_data.get('selected_plan_id')
+    plan_data = user_data.get('selected_plan_data')
+
+    if not all([method_id, plan_id, plan_data]):
+        await callback.answer("❌ Ошибка данных")
+        return
+
+    payload = f"{plan_id}|{method_id}"
+
+    currency_type = 'stars' if PAYMENT_METHODS[method_id]['currency'] == 'XTR' else 'rub'
+    price = plan_data[f"price_{currency_type}"]
+
+    await bot.send_invoice(
+        chat_id=callback.message.chat.id,
+        title=f"VPN подписка - {plan_data['title']}",
+        description=f"Нажимая кнопку «Заплатить» Вы соглашаетесь с правилами VPN бота (/help)",
+        provider_token=PAYMENT_METHODS[method_id]['provider_token'],
+        currency=PAYMENT_METHODS[method_id]['currency'],
+        prices=[LabeledPrice(label="VPN подписка", amount=price)],
+        payload=payload,
+        start_parameter='subscription'
+    )
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    await pre_checkout_query.answer(ok=True)
+
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    try:
+        payload = message.successful_payment.invoice_payload
+        if "|" not in payload:
+            raise ValueError("Неверный формат платежа")
+
+        parts = payload.split("|")
+        if len(parts) != 2:
+            raise ValueError("Неверный формат payload")
+        else:
+            # Обработка подписки
+            plan_id, method_id = payload.split("|")
+
+            # Определение типа подписки
+            if plan_id in SUBSCRIPTION_PLANS:
+                plan_data = SUBSCRIPTION_PLANS[plan_id]
+                is_new_subscription = True
+            elif plan_id in RENEWAL_PLANS:
+                plan_data = RENEWAL_PLANS[plan_id]
+                is_new_subscription = False
+            else:
+                raise ValueError(f"Неизвестный план: {plan_id}")
+
+            # Валидация метода оплаты
+            if method_id not in PAYMENT_METHODS:
+                raise ValueError(f"Неизвестный метод оплаты: {method_id}")
+
+            method_data = PAYMENT_METHODS[method_id]
+            duration_months = plan_data['duration']
+            traffic_gb = plan_data['traffic_gb']
+
+            user_id = message.from_user.id
+            username = message.from_user.username or f"user_{user_id}"
             
-            if row["status"] == "completed":
-                await callback.message.answer("⚠️ Платеж уже обработан")
-                return
-            
-            # Complete payment
-            db.complete_payment(payment_id)
-            db.update_user_balance(row["user_id"], row["amount"])
-            
-            await callback.message.answer(f"✅ Платеж #{payment_id} подтвержден. Баланс пополнен.")
-            
-            # Notify user
+            # Создаем VPN подключение
             try:
-                await callback.bot.send_message(
-                    row["user_id"],
-                    f"✅ Ваш платеж #{payment_id} подтвержден!\n\n"
-                    f"💰 Пополнено: {row['amount']}₽\n"
-                    f"💵 Текущий баланс: {db.get_user(row['user_id']).balance}₽"
+                result = xui_client.add_vless_client(
+                    telegram_user_id=user_id,
+                    display_name=username,
+                    traffic_gb=traffic_gb,
+                    days_valid=duration_months * 30,
                 )
+                vless_client_id = result.get("id")
+                vless_link = result.get("link")
             except Exception as e:
-                logger.error(f"Failed to notify user: {e}")
+                logger.error(f"Failed to create x-ui client: {e}")
+                raise ValueError(f"Ошибка при создании VPN подключения: {e}")
 
-    @dp.message(F.text == "🎁 Инвайт")
-    @dp.message(Command("invite"))
-    async def on_invite(msg: Message):
-        db: Database = dp["db"]
-        user_id = msg.from_user.id
-        invite_code = db.get_user_invite_code(user_id)
-        user = db.get_user(user_id)
-        
-        bot_username = (await msg.bot.get_me()).username
-        invite_link = f"https://t.me/{bot_username}?start={invite_code}"
-        
-        invite_text = f"""🎁 <b>Реферальная программа</b>
+            # Обновление подписки в базе данных
+            with get_connection(cfg.database.db_path) as conn:
+                cursor = conn.cursor()
 
-🔗 <b>Ваша реферальная ссылка:</b>
-<code>{invite_link}</code>
+                if is_new_subscription:
+                    # Новая подписка
+                    cursor.execute('''
+                        UPDATE users 
+                        SET 
+                            pay_subscribed = 1,
+                            subscription_end = DATE('now', ?),
+                            renewal_used = 0,
+                            vless_client_id = ?,
+                            vless_link = ?
+                        WHERE user_id = ?
+                    ''', (f"+{duration_months} months", vless_client_id, vless_link, user_id))
+                else:
+                    # Продление существующей подписки
+                    cursor.execute('''
+                        UPDATE users 
+                        SET 
+                            subscription_end = DATE(subscription_end, ?),
+                            renewal_used = 1,
+                            vless_client_id = ?,
+                            vless_link = ?
+                        WHERE user_id = ?
+                    ''', (f"+{duration_months} months", vless_client_id, vless_link, user_id))
 
-📋 <b>Ваш инвайт-код:</b>
-<code>{invite_code}</code>
+                # Получаем обновленную дату окончания
+                cursor.execute('''
+                    SELECT subscription_end FROM users WHERE user_id = ?
+                ''', (user_id,))
+                subscription_end = cursor.fetchone()[0]
+                
+                # Сохраняем платеж
+                cursor.execute('''
+                    INSERT INTO payments (user_id, amount, currency, plan_id, plan_type, status, telegram_payment_charge_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    user_id,
+                    plan_data[f"price_{'stars' if method_data['currency'] == 'XTR' else 'rub'}"],
+                    method_data['currency'],
+                    plan_id,
+                    'subscription',
+                    'completed',
+                    message.successful_payment.telegram_payment_charge_id
+                ))
+                
+                conn.commit()
 
-👥 Приглашено пользователей: {user.invited_count if user else 0}
-💰 Бонус за каждого: {dp['config'].payment.referral_bonus}₽
+            # Форматирование дат
+            activation_date = datetime.now().strftime("%d.%m.%Y")
+            end_date = datetime.strptime(subscription_end, "%Y-%m-%d").strftime("%d.%m.%Y")
 
-💡 Поделитесь ссылкой с друзьями и получайте бонусы!"""
-        
-        await msg.answer(invite_text, parse_mode="HTML")
+            # Форматирование цены
+            price_key = f"price_{'stars' if method_data['currency'] == 'XTR' else 'rub'}"
+            price = plan_data[price_key]
 
-    @dp.message(F.text == "📊 Статистика")
-    @dp.message(Command("stats"))
-    async def on_stats(msg: Message):
-        db: Database = dp["db"]
-        user_id = msg.from_user.id
-        user = db.get_user(user_id)
-        
-        if not user:
-            await msg.answer("❌ Пользователь не найден")
-            return
-        
-        subscriptions = db.get_user_subscriptions(user_id)
-        active_sub = db.get_user_active_subscription(user_id)
-        
-        stats_text = f"""📊 <b>Ваша статистика</b>
+            if method_data['currency'] == 'XTR':
+                formatted_price = f"{price} Stars (≈ {price * 0.01:.2f}₽)"
+            else:
+                formatted_price = f"{price // 100}₽"
 
-👤 ID: {user_id}
-💰 Баланс: {user.balance}₽
-👥 Приглашено: {user.invited_count}
-📦 Всего подписок: {len(subscriptions)}
-✅ Активных: {1 if active_sub else 0}
+            # Формирование квитанции
+            receipt = (
+                f"💳 <b>VPN</b> успешно активирован!\n\n"
+                f"<b>Чек на оплату</b>\n"
+                f"Дата активации: <i>{activation_date}</i>\n"
+                f"Дата окончания: <i>{end_date}</i>\n"
+                f"Способ оплаты: <i>{method_data['title']}</i>\n"
+                f"Сумма оплаты: <i>{formatted_price}</i>\n\n"
+                f"<b>Детали VPN</b>:\n"
+                f"• План: <i>{plan_data['title']}</i>\n"
+                f"• Трафик: <i>{traffic_gb} ГБ</i>\n"
+                f"• Срок: <i>{duration_months} месяцев</i>\n\n"
+                f"🔗 <b>Ваша VPN ссылка:</b>\n"
+                f"<code>{vless_link}</code>\n\n"
+                f"ID транзакции: <blockquote>{message.successful_payment.telegram_payment_charge_id}</blockquote>"
+            )
 
-📅 Регистрация: {user.created_at.strftime('%d.%m.%Y') if user.created_at else 'N/A'}"""
-        
-        await msg.answer(stats_text, parse_mode="HTML")
+            await message.answer(receipt, parse_mode='HTML')
 
-    @dp.message(Command("admin"))
-    async def on_admin(msg: Message):
-        if msg.from_user.id not in dp["config"].bot.admin_ids:
-            await msg.answer("❌ У вас нет доступа к админ-панели")
-            return
-        
-        db: Database = dp["db"]
-        users = db.get_all_users()
-        
-        total_users = len(users)
-        total_balance = sum(u.balance for u in users)
-        total_referrals = sum(u.invited_count for u in users)
-        
-        admin_text = f"""👨‍💼 <b>Админ-панель</b>
-
-👥 Всего пользователей: {total_users}
-💰 Общий баланс: {total_balance}₽
-🎁 Всего рефералов: {total_referrals}"""
-        
-        await msg.answer(admin_text, parse_mode="HTML")
-
-    @dp.callback_query(F.data == "refresh_sub")
-    async def on_refresh_sub(callback: CallbackQuery):
-        await callback.answer("Обновлено")
-        db: Database = dp["db"]
-        sub_service: SubscriptionService = dp["sub_service"]
-        
-        user_id = callback.from_user.id
-        info_text = sub_service.format_subscription_message(user_id)
-        
-        await callback.message.edit_text(
-            info_text,
-            reply_markup=get_subscription_keyboard(),
-            parse_mode="HTML"
+    except Exception as e:
+        logging.error(f"Ошибка обработки платежа: {str(e)}", exc_info=True)
+        await message.answer(
+            "❌ Произошла ошибка при обработке платежа. "
+            "Пожалуйста, обратитесь в поддержку."
         )
 
-    @dp.callback_query(F.data == "buy_sub")
-    async def on_buy_sub_callback(callback: CallbackQuery):
-        await callback.answer()
-        plans = SubscriptionService.PLANS
-        plans_text = "🛒 <b>Доступные тарифы:</b>\n\n"
-        for i, plan in enumerate(plans):
-            traffic_info = "♾️ Безлимит" if plan.traffic_gb == 0 else f"{plan.traffic_gb} ГБ"
-            plans_text += f"{i+1}. <b>{plan.name}</b>\n"
-            plans_text += f"   📊 Трафик: {traffic_info}\n"
-            plans_text += f"   ⏱ Срок: {plan.days} дней\n"
-            plans_text += f"   💰 Цена: {plan.price}₽\n\n"
-        
-        await callback.message.answer(
-            plans_text,
-            reply_markup=get_plans_keyboard(),
-            parse_mode="HTML"
-        )
+@dp.callback_query(F.data == "open_invite")
+@dp.message(Command("invite"))
+async def handle_open_invite(message_or_callback: Message | CallbackQuery):
+    if isinstance(message_or_callback, CallbackQuery):
+        message = message_or_callback.message
+        await message_or_callback.answer()
+    else:
+        message = message_or_callback
+    
+    user_id = message.from_user.id
 
-    @dp.callback_query(F.data == "cancel")
-    async def on_cancel(callback: CallbackQuery):
-        await callback.answer("Отменено")
-        await callback.message.delete()
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT referral_code, referral_count 
+            FROM users 
+            WHERE user_id = ?
+        ''', (user_id,))
+        result = cursor.fetchone()
 
-    @dp.callback_query(F.data == "cancel_payment")
-    async def on_cancel_payment(callback: CallbackQuery):
-        await callback.answer("Отменено")
+        if not result:
+            await message.answer("❌ Сначала запустите бота через /start")
+            return
 
-    return dp
+        referral_code, referral_count = result
 
+        # Если код по какой-то причине отсутствует в БД
+        if not referral_code:
+            referral_code = secrets.token_hex(4)
+            cursor.execute('''
+                UPDATE users
+                SET referral_code = ?
+                WHERE user_id = ?
+            ''', (referral_code, user_id))
+            conn.commit()
 
-async def main() -> None:
-    cfg = load_config()
-    bot = Bot(cfg.bot.bot_token)
-    dp = create_dp(cfg)
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    bot_username = (await bot.get_me()).username
+    ref_link = f"https://t.me/{bot_username}?start=ref_{referral_code}"
+    text = (
+        f"🎁 <b>Пригласи друга и получи +5 дней VPN!</b>\n\n"
+        f"🔗 Ваша реферальная ссылка:\n<code>{ref_link}</code>\n\n"
+        f"👥 Приглашено друзей: <i>{referral_count}</i>\n"
+        f"За каждого друга вы получаете +5 дней VPN, а друг получает +3 дня!"
+    )
 
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="📤 Поделиться",
+            url=f"https://t.me/share/url?url={ref_link}&text={quote('Присоединяйся к VPN боту с моей подпиской!')}"
+        )],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="go_back")]
+    ])
+
+    await message.answer(text, parse_mode='HTML', reply_markup=keyboard)
+
+@dp.callback_query(F.data == "go_back")
+async def go_back_handler(callback: CallbackQuery):
+    """Обработчик кнопки Назад"""
+    user_id = callback.from_user.id
+    await callback.message.edit_text(
+        "👋 Главное меню",
+        reply_markup=get_main_keyboard(user_id)
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "sub_back_to_plan")
+async def handle_sub_back_to_plan(callback: CallbackQuery, state: FSMContext):
+    await handle_sub_info(callback, state)
+
+@dp.callback_query(F.data == "open_help")
+@dp.message(Command("help"))
+async def handle_open_help(message_or_callback: Message | CallbackQuery):
+    if isinstance(message_or_callback, CallbackQuery):
+        message = message_or_callback.message
+        await message_or_callback.answer()
+    else:
+        message = message_or_callback
+    
+    report_button = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="go_back")]
+    ])
+
+    await message.answer(
+        "🤖<b>VPN бот</b> — быстрый и надежный VPN сервис\n\n"
+        "<b>Бот предоставляет</b>:\n"
+        "• Быстрый и безопасный VPN\n"
+        "• Обход всех блокировок\n"
+        "• Высокая скорость подключения\n\n"
+        "<b>Как пользоваться</b>?\n"
+        "• Купите подписку через /prem\n"
+        "• Получите VPN ссылку\n"
+        "• Импортируйте ссылку в приложение (v2rayNG, sing-box и т.п.)\n"
+        "• Подключитесь!\n\n"
+        "<b>Реферальная программа</b>:\n"
+        "• Пригласите друга через /invite\n"
+        "• Вы получите +5 дней VPN\n"
+        "• Друг получит +3 дня VPN\n\n"
+        "📌 <b>Команды</b>:\n"
+        "/start - Перезагрузить бота\n"
+        "/prem - Покупка VPN\n"
+        "/invite - Пригласи друга\n",
+        reply_markup=report_button,
+        parse_mode="HTML"
+    )
+
+async def daily_scheduler():
+    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+    scheduler.add_job(
+        check_expired_subscriptions,
+        'cron',
+        hour=12,
+        minute=0,
+        args=[cfg.database.db_path]
+    )
+    scheduler.start()
+
+async def main():
+    asyncio.create_task(daily_scheduler())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
+    print("Бот запущен!")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+    print("\nБот остановлен!")

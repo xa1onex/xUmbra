@@ -2,5 +2,7 @@ aiogram==3.13.1
 httpx==0.27.2
 pydantic==2.9.2
 python-dotenv==1.0.1
+APScheduler>=3.10.0
+pytz>=2023.3
 uvloop==0.20.0; platform_system == 'Linux'
 
