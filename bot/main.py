@@ -95,7 +95,12 @@ def create_dp(cfg) -> Dispatcher:
         db: Database = dp["db"]
         user_id = msg.from_user.id
         username = msg.from_user.username
-        full_name = msg.from_user.get_full_name()
+        # Get full name from first_name and last_name
+        full_name = (
+            f"{msg.from_user.first_name or ''} {msg.from_user.last_name or ''}".strip()
+            if msg.from_user.first_name or msg.from_user.last_name
+            else None
+        )
         
         # Check for invite code
         referrer_id = None
