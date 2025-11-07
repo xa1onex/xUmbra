@@ -281,128 +281,161 @@ async def handle_sub_info(message_or_callback: Message | CallbackQuery, state: F
     user_id = message.from_user.id
     with get_connection(cfg.database.db_path) as conn:
         cursor = conn.cursor()
+        # Получаем все данные пользователя, без фильтрации по дате в SQL
         cursor.execute('''
             SELECT 
                 subscription_end,
                 vless_link,
-                julianday(subscription_end) - julianday('now') as days_remaining 
+                pay_subscribed
             FROM users 
-            WHERE user_id = ? 
-                AND pay_subscribed = 1 
-                AND subscription_end >= DATE('now')
+            WHERE user_id = ?
         ''', (user_id,))
         result = cursor.fetchone()
 
     builder = InlineKeyboardBuilder()
     text = "💳 <b>Информация о вашем VPN:</b>\n\n"
 
+    # Проверяем подписку как в /start - через Python
     if result:
-        subscription_end, vless_link, days_remaining = result
-        days_remaining = int(days_remaining) if days_remaining else 0
-        end_date = datetime.strptime(subscription_end, "%Y-%m-%d").strftime("%d.%m.%Y")
+        subscription_end, vless_link, pay_subscribed = result
+        is_active = False
         
-        # Если подписка активна - показываем информацию и VPN ссылку
-        text = (
-            "✅ Ваш <b>VPN</b> <b>активен</b>!\n\n"
-            f"📅 Дата окончания: <i>{end_date}</i>\n"
-            f"⏰ Осталось дней: <i>{days_remaining}</i>\n\n"
-        )
-        
-        # Показываем VPN ссылку если она есть
-        if vless_link:
-            text += (
-                f"🔗 <b>Ваша VPN ссылка:</b>\n"
-                f"<code>{vless_link}</code>\n\n"
-                f"📱 <b>Как использовать:</b>\n"
-                f"1. Нажмите на ссылку выше, чтобы скопировать\n"
-                f"2. Скачайте приложение (v2rayNG, sing-box и т.п.)\n"
-                f"3. Импортируйте ссылку в приложение\n"
-                f"4. Подключитесь!\n\n"
-            )
+        # Проверяем, активна ли подписка
+        if pay_subscribed == 1 and subscription_end:
+            try:
+                # Парсим дату окончания
+                if isinstance(subscription_end, str):
+                    # Может быть формат 'YYYY-MM-DD' или 'YYYY-MM-DD HH:MM:SS'
+                    if ' ' in subscription_end:
+                        end_date = datetime.strptime(subscription_end.split()[0], "%Y-%m-%d")
+                    else:
+                        end_date = datetime.strptime(subscription_end, "%Y-%m-%d")
+                else:
+                    end_date = subscription_end
+                
+                # Проверяем, не истекла ли подписка (сравниваем только даты)
+                today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                end_date_only = end_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                
+                if end_date_only >= today:
+                    is_active = True
+                    days_remaining = (end_date_only - today).days
+                    end_date_str = end_date.strftime("%d.%m.%Y")
+            except Exception as e:
+                logger.error(f"Error parsing subscription date: {e}, date: {subscription_end}")
+                is_active = False
         else:
-            text += (
-                "⚠️ VPN ссылка не найдена. Обратитесь в поддержку.\n\n"
-            )
+            is_active = False
         
-        text += (
-            "<b>Детали VPN</b>:\n"
-            "• Быстрый и безопасный VPN\n"
-            "• Обход всех блокировок\n"
-            "• Высокая скорость\n\n"
-        )
-        
-        # Показываем кнопки продления только если осталось <= 3 дня
-        if days_remaining <= 3:
-            text += (
-                "🎁 <b>Специальное предложение!</b>\n\n"
-                "🔥 Успей продлить <b>VPN</b> по специальной цене:\n"
-                f"1 месяц <s>199₽</s> - 149₽\n"
-                f"3 месяца <s>499₽</s> - 399₽\n"
-                f"6 месяцев <s>899₽</s> - 749₽\n"
-                f"12 месяцев <s>1499₽</s> - 1199₽\n\n"
+        if is_active:
+            # Если подписка активна - показываем информацию и VPN ссылку
+            text = (
+                "✅ Ваш <b>VPN</b> <b>активен</b>!\n\n"
+                f"📅 Дата окончания: <i>{end_date_str}</i>\n"
+                f"⏰ Осталось дней: <i>{days_remaining}</i>\n\n"
             )
-            for plan_id, plan_data in RENEWAL_PLANS.items():
+            
+            # Показываем VPN ссылку если она есть
+            if vless_link:
+                text += (
+                    f"🔗 <b>Ваша VPN ссылка:</b>\n"
+                    f"<code>{vless_link}</code>\n\n"
+                    f"📱 <b>Как использовать:</b>\n"
+                    f"1. Нажмите на ссылку выше, чтобы скопировать\n"
+                    f"2. Скачайте приложение (v2rayNG, sing-box и т.п.)\n"
+                    f"3. Импортируйте ссылку в приложение\n"
+                    f"4. Подключитесь!\n\n"
+                )
+            else:
+                text += (
+                    "⚠️ VPN ссылка не найдена. Обратитесь в поддержку.\n\n"
+                )
+            
+            text += (
+                "<b>Детали VPN</b>:\n"
+                "• Быстрый и безопасный VPN\n"
+                "• Обход всех блокировок\n"
+                "• Высокая скорость\n\n"
+            )
+            
+            # Показываем кнопки продления только если осталось <= 3 дня
+            if days_remaining <= 3:
+                text += (
+                    "🎁 <b>Специальное предложение!</b>\n\n"
+                    "🔥 Успей продлить <b>VPN</b> по специальной цене:\n"
+                    f"1 месяц <s>199₽</s> - 149₽\n"
+                    f"3 месяца <s>499₽</s> - 399₽\n"
+                    f"6 месяцев <s>899₽</s> - 749₽\n"
+                    f"12 месяцев <s>1499₽</s> - 1199₽\n\n"
+                )
+                for plan_id, plan_data in RENEWAL_PLANS.items():
+                    builder.button(
+                        text=f"{plan_data['title']} - {plan_data['price_rub'] // 100}₽ | {plan_data['price_stars']}⭐",
+                        callback_data=f"plan:{plan_id}"
+                    )
+                builder.adjust(1)
+            else:
+                text += "💡 Ваша подписка активна. Вы сможете продлить её за 3 дня до окончания.\n\n"
+            
+            # Кнопка "Назад" всегда
+            builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
+            
+            # Если это callback - редактируем сообщение, иначе отправляем новое
+            if is_callback:
+                await message.edit_text(
+                    text,
+                    reply_markup=builder.as_markup(),
+                    parse_mode="HTML"
+                )
+            else:
+                await message.answer(
+                    text,
+                    reply_markup=builder.as_markup(),
+                    parse_mode="HTML"
+                )
+            
+            # Устанавливаем состояние только если есть кнопки продления
+            if days_remaining <= 3:
+                await state.set_state(SubscriptionSteps.CHOOSING_PLAN)
+            else:
+                await state.clear()
+        else:
+            # Подписка неактивна - показываем планы для покупки
+            text += (
+                "❌ Ваш VPN <b>неактивен</b>!\n\n"
+                "Что ты получишь с <b>VPN</b>?\n"
+                "• Быстрый и безопасный VPN\n"
+                "• Обход всех блокировок\n"
+                "• Высокая скорость подключения\n\n"
+                "Выберите план подписки:\n"
+            )
+            for plan_id, plan_data in SUBSCRIPTION_PLANS.items():
                 builder.button(
                     text=f"{plan_data['title']} - {plan_data['price_rub'] // 100}₽ | {plan_data['price_stars']}⭐",
                     callback_data=f"plan:{plan_id}"
                 )
             builder.adjust(1)
-        else:
-            text += "💡 Ваша подписка активна. Вы сможете продлить её за 3 дня до окончания.\n\n"
-        
-        # Кнопка "Назад" всегда
-        builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
-        
-        # Если это callback - редактируем сообщение, иначе отправляем новое
-        if is_callback:
-            await message.edit_text(
-                text,
-                reply_markup=builder.as_markup(),
-                parse_mode="HTML"
-            )
-        else:
-            await message.answer(
-                text,
-                reply_markup=builder.as_markup(),
-                parse_mode="HTML"
-            )
-        
-        # Устанавливаем состояние только если есть кнопки продления
-        if days_remaining <= 3:
-            await state.set_state(SubscriptionSteps.CHOOSING_PLAN)
-        else:
-            await state.clear()
-    else:
-        # Подписка неактивна - показываем планы для покупки
-        text += (
-            "❌ Ваш VPN <b>неактивен</b>!\n\n"
-            "Что ты получишь с <b>VPN</b>?\n"
-            "• Быстрый и безопасный VPN\n"
-            "• Обход всех блокировок\n"
-            "• Высокая скорость подключения\n\n"
-            "Выберите план подписки:\n"
-        )
-        for plan_id, plan_data in SUBSCRIPTION_PLANS.items():
-            builder.button(
-                text=f"{plan_data['title']} - {plan_data['price_rub'] // 100}₽ | {plan_data['price_stars']}⭐",
-                callback_data=f"plan:{plan_id}"
-            )
-        builder.adjust(1)
-        builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
+            builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
 
-        if is_callback:
-            await message.edit_text(
-                text,
-                reply_markup=builder.as_markup(),
-                parse_mode="HTML"
-            )
-        else:
-            await message.answer(
-                text,
-                reply_markup=builder.as_markup(),
-                parse_mode="HTML"
-            )
-        await state.set_state(SubscriptionSteps.CHOOSING_PLAN)
+            if is_callback:
+                await message.edit_text(
+                    text,
+                    reply_markup=builder.as_markup(),
+                    parse_mode="HTML"
+                )
+            else:
+                await message.answer(
+                    text,
+                    reply_markup=builder.as_markup(),
+                    parse_mode="HTML"
+                )
+            await state.set_state(SubscriptionSteps.CHOOSING_PLAN)
+    else:
+        # Пользователь не найден в базе
+        text += (
+            "❌ Вы не зарегистрированы! Используйте /start для регистрации."
+        )
+        await message.answer(text, parse_mode="HTML")
 
 @dp.callback_query(SubscriptionSteps.CHOOSING_PLAN, F.data.startswith("plan:"))
 async def select_plan(callback: CallbackQuery, state: FSMContext):
@@ -762,7 +795,7 @@ async def handle_open_help(message_or_callback: Message | CallbackQuery):
         [InlineKeyboardButton(text="◀️ Назад", callback_data="go_back")]
     ])
 
-    await message.answer(
+    await message.answercallback.message.edit_text(
         "🤖<b>VPN бот</b> — быстрый и надежный VPN сервис\n\n"
         "<b>Бот предоставляет</b>:\n"
         "• Быстрый и безопасный VPN\n"
