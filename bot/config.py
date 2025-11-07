@@ -16,9 +16,20 @@ class BotConfig(BaseModel):
     admin_ids: list[int] = Field(default_factory=list)
 
 
+class DatabaseConfig(BaseModel):
+    db_path: str = Field(default="vpn_bot.db", description="Path to SQLite database file")
+
+
+class PaymentConfig(BaseModel):
+    referral_bonus: float = Field(default=50.0, description="Bonus for referring a new user")
+    min_payment: float = Field(default=100.0, description="Minimum payment amount")
+
+
 class AppConfig(BaseModel):
     bot: BotConfig
     xui: XUIConfig
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    payment: PaymentConfig = Field(default_factory=PaymentConfig)
 
 
 def load_config() -> AppConfig:
@@ -34,6 +45,13 @@ def load_config() -> AppConfig:
         api_token=os.getenv("XUI_API_TOKEN"),
         inbound_id=int(os.environ["XUI_INBOUND_ID"]),
     )
-    return AppConfig(bot=bot, xui=xui)
+    database = DatabaseConfig(
+        db_path=os.getenv("DB_PATH", "vpn_bot.db"),
+    )
+    payment = PaymentConfig(
+        referral_bonus=float(os.getenv("REFERRAL_BONUS", "50.0")),
+        min_payment=float(os.getenv("MIN_PAYMENT", "100.0")),
+    )
+    return AppConfig(bot=bot, xui=xui, database=database, payment=payment)
 
 

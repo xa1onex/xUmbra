@@ -80,12 +80,15 @@ class XUIClient:
         email = f"tg_{telegram_user_id}_{int(time.time())}@xui"
 
         # Формируем клиента как в вашем рабочем скрипте
+        # Если traffic_gb is None или 0, то безлимит (0 байт = безлимит в x-ui)
+        total_gb_bytes = 0 if (traffic_gb is None or traffic_gb == 0) else traffic_gb * 1073741824
+        
         client_dict = {
             "id": client_uuid,
             "email": email,
             "alterId": 64,  # default for vless (можно поменять)
             "limitIp": 3,    # примерная квота (можно поменять)
-            "totalGB": (traffic_gb or 0) * 1073741824 if traffic_gb != 0 else 0,
+            "totalGB": total_gb_bytes,
             "expiryTime": expiry_time,
             "enable": True,
             "tgId": email,
