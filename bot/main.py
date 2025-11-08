@@ -1375,7 +1375,7 @@ async def handle_key_server_selection(callback: CallbackQuery, state: FSMContext
                     cursor.execute('DELETE FROM vpn_keys WHERE id = ? AND user_id = ?', (key_to_replace, user_id))
                     conn.commit()
                 
-                # Пытаемся удалить клиент с сервера (если возможно)
+                # Удаляем старый клиент с сервера
                 old_server_data = get_server_by_id(old_server_id)
                 if old_server_data:
                     old_server_id_db, old_server_name, old_server_ip, old_server_username, old_server_password, old_server_inbound_id, old_server_base_url = old_server_data
@@ -1386,10 +1386,11 @@ async def handle_key_server_selection(callback: CallbackQuery, state: FSMContext
                             password=old_server_password,
                             inbound_id=old_server_inbound_id
                         )
-                        # Здесь можно добавить метод удаления клиента, если он есть в XUIClient
-                        # old_server_client.delete_client(old_vless_client_id)
+                        old_server_client.delete_client(old_vless_client_id)
+                        logger.info(f"Successfully deleted old client {old_vless_client_id} from server {old_server_id}")
                     except Exception as e:
                         logger.error(f"Failed to delete old client from server: {e}")
+                        # Продолжаем работу даже если не удалось удалить старый клиент
         
         await callback.message.edit_text(
             f"✅ <b>Ключ успешно {'заменен' if key_to_replace else 'создан'}!</b>\n\n"
@@ -1546,7 +1547,7 @@ async def handle_confirm_delete(callback: CallbackQuery, state: FSMContext):
     if server_data:
         server_id_db, server_name, server_ip, server_username, server_password, server_inbound_id, server_base_url = server_data
         
-        # Удаляем клиент с сервера (если возможно)
+        # Удаляем клиент с сервера
         try:
             server_client = XUIClient(
                 base_url=server_base_url,
@@ -1554,10 +1555,11 @@ async def handle_confirm_delete(callback: CallbackQuery, state: FSMContext):
                 password=server_password,
                 inbound_id=server_inbound_id
             )
-            # Здесь можно добавить метод удаления клиента, если он есть в XUIClient
-            # server_client.delete_client(vless_client_id)
+            server_client.delete_client(vless_client_id)
+            logger.info(f"Successfully deleted client {vless_client_id} from server {server_id}")
         except Exception as e:
             logger.error(f"Failed to delete client from server: {e}")
+            # Продолжаем удаление из БД даже если не удалось удалить с сервера
     
     # Удаляем ключ из БД
     with get_connection(cfg.database.db_path) as conn:

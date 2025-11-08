@@ -268,4 +268,35 @@ class XUIClient:
             "link": link,
         }
 
+    def delete_client(self, client_id: str) -> None:
+        """Удаляет клиента из inbound на панели x-ui/3x-ui"""
+        self.ensure_login()
+        
+        inbound_id = self.inbound_id
+        if not inbound_id:
+            raise RuntimeError("inbound_id is not set")
+        
+        # Формируем payload для удаления клиента
+        client_dict = {
+            "id": client_id
+        }
+        payload = {
+            "id": inbound_id,
+            "settings": json.dumps({"clients": [client_dict]})
+        }
+        headers = {"Content-Type": "application/json", **self._auth_headers()}
+        
+        # Используем endpoint для удаления клиента
+        endpoint = "panel/api/inbounds/delClient"
+        print(f"[xui] POST {self.base_url}{endpoint} payload: {payload}")
+        resp = self._client.post(endpoint, json=payload, headers=headers)
+        print(f"[xui] Status={resp.status_code} Response={resp.text}")
+        
+        if resp.status_code != 200:
+            raise RuntimeError(f"delClient failed: {resp.status_code} {resp.text}")
+        
+        data = resp.json()
+        if not data.get("success", True):
+            raise RuntimeError(f"delClient error: {data}")
+
 
