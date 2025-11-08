@@ -121,6 +121,27 @@ class AddServerSteps(StatesGroup):
     WAITING_INBOUND_ID = State()
     CONFIRMING = State()
 
+class AdminEditStates(StatesGroup):
+    EDIT_ANNOUNCEMENT = State()
+
+ANNOUNCEMENT_FILE = "announcement.txt"
+
+def get_announcement_text() -> str:
+    """Получает текст объявления из файла, если есть, иначе возвращает дефолтный текст"""
+    try:
+        with open(ANNOUNCEMENT_FILE, "r", encoding="utf-8") as f:
+            ann = f.read().strip()
+            if ann:
+                return
+    except Exception:
+        pass
+    return "!!!ВНИМАНИЕ!!! то бета-тест, VPN работает нестабильно, платежи также находятся в тестировании - они не реальны!!!\n"  # дефолт
+
+def set_announcement_text(new_text: str):
+    """Сохраняет текст объявления в файл"""
+    with open(ANNOUNCEMENT_FILE, "w", encoding="utf-8") as f:
+        f.write(new_text.strip())
+
 cfg = load_config()
 bot = Bot(token=cfg.bot.bot_token)
 dp = Dispatcher()
@@ -137,6 +158,8 @@ def get_main_keyboard(user_id: int):
     builder.row(
         InlineKeyboardButton(text="🆘 Помощь", callback_data="open_help")
     )
+    if is_admin(user_id):
+        builder.row(InlineKeyboardButton(text="✏️ Редактировать объявление", callback_data="edit_announcement"))
     return builder.as_markup()
 
 def get_subscription_status(user_id: int) -> str:
@@ -156,18 +179,19 @@ def get_subscription_status(user_id: int) -> str:
                 return f"активен до {end_date.strftime('%d.%m.%Y')}"
     return "неактивен"
 
-def get_main_text(first_name: str, subscription_status: str) -> str:
-    """Возвращает основной текст"""
-    return (
+def get_main_text(first_name: str, subscription_status: str, user_id: int = None) -> str:
+    """Возвращает основной текст с объявлением"""
+    ann = get_announcement_text()
+    msg = (
         f"👋 Рады видеть тебя снова, <b>{first_name}</b>!\n\n"
         f"<b>VPN</b>: <i>{subscription_status}</i>\n\n"
         f"📌 <b>Команды:</b>\n"
         "<i>/start</i> - Перезагрузить бота\n"
         "<i>/prem</i> - Покупка VPN\n"
         "<i>/invite</i> - Пригласи друга\n\n"
-        "<code>!!!ВНИМАНИЕ!!! Это бета-тест, VPN работает нестабильно, платежи также находятся в тестировании - они не реальны!!!\n"
-        "b1.1.8</code>"
+        f"<code>{ann}\nb1.1.8</code>"
     )
+    return msg
 
 @dp.message(CommandStart())
 async def handle_start(message: Message):
@@ -282,7 +306,7 @@ async def handle_start(message: Message):
 
             subscription_status = get_subscription_status(user_id)
             await message.answer(
-                get_main_text(first_name, subscription_status),
+                get_main_text(first_name, subscription_status, user_id),
                 parse_mode="HTML",
                 reply_markup=get_main_keyboard(user_id)
             )
@@ -981,7 +1005,7 @@ async def go_back_handler(callback: CallbackQuery):
     subscription_status = get_subscription_status(user_id)
 
     await callback.message.edit_text(
-        text=get_main_text(first_name, subscription_status),
+        text=get_main_text(first_name, subscription_status, user_id),
         parse_mode='HTML',
         reply_markup=get_main_keyboard(user_id)
     )
@@ -1037,6 +1061,32 @@ async def handle_open_help(message_or_callback: Message | CallbackQuery):
             reply_markup=report_button,
             parse_mode="HTML"
         )
+
+@dp.callback_query(F.data == "edit_announcement")
+async def start_edit_announcement(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "✏️ Введите новый текст объявления.\n\n<code>Он будет показан в главном меню всем пользователям.</code>",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminEditStates.EDIT_ANNOUNCEMENT)
+    await callback.answer()
+
+@dp.message(AdminEditStates.EDIT_ANNOUNCEMENT)
+async def save_announcement_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав", parse_mode="HTML")
+        await state.clear()
+        return
+    new_ann = message.text[:2048] if message.text else ''
+    if not new_ann.strip():
+        await message.answer("Сообщение не может быть пустым. Попробуйте снова (или отмените командой /start)")
+        return
+    set_announcement_text(new_ann)
+    await message.answer("✅ Объявление обновлено! Теперь оно показывается всем пользователям.", parse_mode="HTML")
+    await state.clear()
 
 def is_admin(user_id: int) -> bool:
     """Проверка, является ли пользователь админом"""
