@@ -1193,28 +1193,24 @@ async def handle_manage_keys(callback: CallbackQuery):
     
     if not keys:
         text += "У вас пока нет ключей. Создайте первый ключ!"
-    else:
-        text += "<b>Ваши ключи:</b>\n"
-        for key_id, key_name, vless_link, created_at, expires_at, traffic_gb, is_active, server_name in keys:
-            status = "✅" if is_active else "❌"
-            name = key_name or f"Ключ #{key_id}"
-            text += f"{status} <b>{name}</b>\n"
-            if server_name:
-                text += f"   Сервер: {server_name}\n"
-            if created_at:
-                try:
-                    created = datetime.strptime(created_at.split()[0], "%Y-%m-%d").strftime("%d.%m.%Y")
-                    text += f"   Создан: {created}\n"
-                except:
-                    pass
-            text += "\n"
     
     builder = InlineKeyboardBuilder()
+    
+    # Показываем кнопки с ключами
+    for key_id, key_name, vless_link, created_at, expires_at, traffic_gb, is_active, server_name in keys:
+        name = key_name or f"Ключ #{key_id}"
+        status_icon = "✅" if is_active else "❌"
+        builder.row(InlineKeyboardButton(
+            text=f"{status_icon} {name}",
+            callback_data=f"view_key:{key_id}"
+        ))
+    
+    # Кнопка создания ключа
     if keys_count < 3:
         builder.row(InlineKeyboardButton(text="➕ Создать ключ", callback_data="create_key"))
-    
-    if keys:
-        builder.row(InlineKeyboardButton(text="📋 Просмотреть ключ", callback_data="view_key_list"))
+    else:
+        # Если лимит превышен, предлагаем заменить ключ
+        builder.row(InlineKeyboardButton(text="➕ Создать ключ (заменить)", callback_data="create_key"))
     
     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
     
@@ -1233,8 +1229,31 @@ async def handle_create_key(callback: CallbackQuery, state: FSMContext):
     
     # Проверяем лимит ключей
     keys_count = get_user_keys_count(user_id)
+    
+    # Если лимит превышен, показываем список ключей для замены
     if keys_count >= 3:
-        await callback.answer("❌ У вас уже максимальное количество ключей (3)", show_alert=True)
+        keys = get_user_keys(user_id)
+        if not keys:
+            await callback.answer("❌ Ошибка: ключи не найдены", show_alert=True)
+            return
+        
+        builder = InlineKeyboardBuilder()
+        for key_id, key_name, vless_link, created_at, expires_at, traffic_gb, is_active, server_name in keys:
+            name = key_name or f"Ключ #{key_id}"
+            builder.row(InlineKeyboardButton(
+                text=f"🔄 Заменить {name}",
+                callback_data=f"replace_key:{key_id}"
+            ))
+        builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="manage_keys"))
+        
+        await callback.message.edit_text(
+            "⚠️ <b>Лимит ключей превышен</b>\n\n"
+            "У вас уже максимальное количество ключей (3).\n"
+            "Выберите ключ, который хотите заменить:",
+            parse_mode="HTML",
+            reply_markup=builder.as_markup()
+        )
+        await callback.answer()
         return
     
     # Получаем список активных серверов
@@ -1500,7 +1519,7 @@ async def handle_view_key(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"delete_key:{key_id_db}"))
     builder.row(InlineKeyboardButton(text="🔄 Заменить", callback_data=f"replace_key:{key_id_db}"))
-    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="view_key_list"))
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="manage_keys"))
     
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
     await callback.answer()
