@@ -214,7 +214,7 @@ def get_main_text(first_name: str, subscription_status: str, user_id: int = None
         "<i>/start</i> - Перезагрузить бота\n"
         "<i>/prem</i> - Покупка VPN\n"
         "<i>/invite</i> - Пригласи друга\n\n"
-        f"<code>{ann}\nb1.1.8</code>"
+        f"<code>{ann}\nb1.1.12</code>"
     )
     return msg
 
@@ -1265,34 +1265,15 @@ async def handle_key_server_selection(callback: CallbackQuery, state: FSMContext
     """Обработчик выбора сервера для ключа"""
     server_id = int(callback.data.split(":")[1])
     await state.update_data(selected_server_id=server_id)
-    await state.set_state(KeyManagementStates.ENTERING_KEY_NAME)
     
-    await callback.message.edit_text(
-        "✏️ Введите название для ключа (необязательно):\n\n"
-        "Или отправьте /skip чтобы пропустить",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-@dp.message(KeyManagementStates.ENTERING_KEY_NAME)
-async def handle_key_name_input(message: Message, state: FSMContext):
-    """Обработка названия ключа"""
-    user_id = message.from_user.id
-    key_name = message.text.strip() if message.text and message.text != "/skip" else None
-    
-    data = await state.get_data()
-    server_id = data.get('selected_server_id')
-    key_to_replace = data.get('key_to_replace')  # Если это замена ключа
-    
-    if not server_id:
-        await message.answer("❌ Ошибка: сервер не выбран")
-        await state.clear()
-        return
+    # Сразу создаем ключ без запроса названия
+    user_id = callback.from_user.id
+    key_to_replace = (await state.get_data()).get('key_to_replace')
     
     # Получаем данные сервера
     server_data = get_server_by_id(server_id)
     if not server_data:
-        await message.answer("❌ Сервер не найден")
+        await callback.answer("❌ Сервер не найден", show_alert=True)
         await state.clear()
         return
     
@@ -1300,7 +1281,7 @@ async def handle_key_name_input(message: Message, state: FSMContext):
     if len(server_data) >= 7:
         server_id_db, server_name, server_ip, server_username, server_password, server_inbound_id, server_base_url = server_data
     else:
-        await message.answer("❌ Ошибка данных сервера")
+        await callback.answer("❌ Ошибка данных сервера", show_alert=True)
         await state.clear()
         return
     
@@ -1312,7 +1293,7 @@ async def handle_key_name_input(message: Message, state: FSMContext):
         ''', (user_id,))
         result = cursor.fetchone()
         if not result or not result[0]:
-            await message.answer("❌ Ошибка: подписка не найдена")
+            await callback.answer("❌ Ошибка: подписка не найдена", show_alert=True)
             await state.clear()
             return
         
@@ -1321,11 +1302,11 @@ async def handle_key_name_input(message: Message, state: FSMContext):
             end_date = datetime.strptime(subscription_end, "%Y-%m-%d")
             days_valid = (end_date - datetime.now()).days
             if days_valid <= 0:
-                await message.answer("❌ Ваша подписка истекла")
+                await callback.answer("❌ Ваша подписка истекла", show_alert=True)
                 await state.clear()
                 return
         except:
-            await message.answer("❌ Ошибка при расчете срока подписки")
+            await callback.answer("❌ Ошибка при расчете срока подписки", show_alert=True)
             await state.clear()
             return
     
@@ -1340,9 +1321,11 @@ async def handle_key_name_input(message: Message, state: FSMContext):
         
         # Используем стандартные значения для трафика (можно настроить)
         traffic_gb = 100  # Можно брать из подписки
+        
+        # Создаем клиента с display_name = server_id (в конце VLESS ссылки будет server_id)
         result = server_client.add_vless_client(
             telegram_user_id=user_id,
-            display_name=key_name or f"key_{user_id}_{int(time.time())}",
+            display_name=str(server_id),  # В конце VLESS ссылки будет server_id
             traffic_gb=traffic_gb,
             days_valid=days_valid,
         )
@@ -1350,7 +1333,7 @@ async def handle_key_name_input(message: Message, state: FSMContext):
         vless_client_id = result.get("id")
         vless_link = result.get("link")
         
-        # Сохраняем ключ в БД
+        # Сохраняем ключ в БД (key_name будет обновлен после получения key_id)
         with get_connection(cfg.database.db_path) as conn:
             cursor = conn.cursor()
             expires_at = end_date.strftime("%Y-%m-%d")
@@ -1358,9 +1341,27 @@ async def handle_key_name_input(message: Message, state: FSMContext):
                 INSERT INTO vpn_keys (user_id, server_id, vless_client_id, vless_link, 
                                     key_name, expires_at, traffic_gb, is_active)
                 VALUES (?, ?, ?, ?, ?, ?, ?, TRUE)
-            ''', (user_id, server_id, vless_client_id, vless_link, key_name, expires_at, traffic_gb))
+            ''', (user_id, server_id, vless_client_id, vless_link, None, expires_at, traffic_gb))
             conn.commit()
             key_id = cursor.lastrowid
+        
+        # Обновляем key_name и vless_link с правильными значениями
+        key_name = f"{server_name} #{key_id}"
+        # Обновляем VLESS ссылку: заменяем последнюю часть (после #) на server_id
+        if '#' in vless_link:
+            vless_link = vless_link.rsplit('#', 1)[0] + f"#{server_id}"
+        else:
+            vless_link = vless_link + f"#{server_id}"
+        
+        # Обновляем запись в БД с правильным key_name и vless_link
+        with get_connection(cfg.database.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE vpn_keys 
+                SET key_name = ?, vless_link = ?
+                WHERE id = ?
+            ''', (key_name, vless_link, key_id))
+            conn.commit()
         
         # Если это замена ключа, удаляем старый
         if key_to_replace:
@@ -1390,10 +1391,10 @@ async def handle_key_name_input(message: Message, state: FSMContext):
                     except Exception as e:
                         logger.error(f"Failed to delete old client from server: {e}")
         
-        await message.answer(
+        await callback.message.edit_text(
             f"✅ <b>Ключ успешно {'заменен' if key_to_replace else 'создан'}!</b>\n\n"
             f"<b>Информация:</b>\n"
-            f"Название: <i>{key_name or 'Без названия'}</i>\n"
+            f"Название: <i>{key_name}</i>\n"
             f"Сервер: <i>{server_name}</i>\n"
             f"Срок действия: <i>{end_date.strftime('%d.%m.%Y')}</i>\n\n"
             f"🔗 <b>VPN ссылка:</b>\n"
@@ -1401,15 +1402,24 @@ async def handle_key_name_input(message: Message, state: FSMContext):
             f"Используйте раздел <b>🔑 Мои ключи</b> для управления ключами.",
             parse_mode="HTML"
         )
+        await callback.answer()
         
     except Exception as e:
         logger.error(f"Failed to create key: {e}")
-        await message.answer(
+        await callback.message.edit_text(
             f"❌ <b>Ошибка при создании ключа:</b>\n<code>{str(e)}</code>\n\n"
             f"Попробуйте позже или обратитесь в поддержку.",
             parse_mode="HTML"
         )
+        await callback.answer()
     
+    await state.clear()
+
+@dp.message(KeyManagementStates.ENTERING_KEY_NAME)
+async def handle_key_name_input(message: Message, state: FSMContext):
+    """Обработка названия ключа - больше не используется, но оставляем для совместимости"""
+    # Эта функция больше не используется, так как мы сразу создаем ключ после выбора сервера
+    await message.answer("❌ Эта функция больше не используется. Выберите сервер заново через раздел '🔑 Мои ключи'.")
     await state.clear()
 
 @dp.callback_query(F.data == "view_key_list")
@@ -1611,14 +1621,10 @@ async def handle_replace_key_server(callback: CallbackQuery, state: FSMContext):
     old_key_id = int(parts[2])
     
     await state.update_data(selected_server_id=server_id, key_to_replace=old_key_id)
-    await state.set_state(KeyManagementStates.ENTERING_KEY_NAME)
     
-    await callback.message.edit_text(
-        "✏️ Введите название для нового ключа (необязательно):\n\n"
-        "Или отправьте /skip чтобы пропустить",
-        parse_mode="HTML"
-    )
-    await callback.answer()
+    # Сразу создаем ключ (используем ту же логику, что и при создании нового)
+    # Вызываем обработчик выбора сервера, который теперь создает ключ сразу
+    await handle_key_server_selection(callback, state)
 
 # ==================== АДМИНСКИЕ КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ СЕРВЕРАМИ ====================
 
