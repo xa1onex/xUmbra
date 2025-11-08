@@ -115,9 +115,7 @@ class SubscriptionSteps(StatesGroup):
 
 class AddServerSteps(StatesGroup):
     WAITING_NAME = State()
-    WAITING_IP = State()
-    WAITING_PROTOCOL = State()
-    WAITING_PORT = State()
+    WAITING_PANEL_URL = State()
     WAITING_USERNAME = State()
     WAITING_PASSWORD = State()
     WAITING_INBOUND_ID = State()
@@ -1088,7 +1086,8 @@ async def cmd_add_server(message: Message, state: FSMContext):
     
     await message.answer(
         "🔧 <b>Добавление нового сервера</b>\n\n"
-        "Введите название сервера (будет видно пользователям):"
+        "Введите название сервера (будет видно пользователям):",
+        parse_mode="HTML"
     )
     await state.set_state(AddServerSteps.WAITING_NAME)
 
@@ -1096,61 +1095,93 @@ async def cmd_add_server(message: Message, state: FSMContext):
 async def process_server_name(message: Message, state: FSMContext):
     """Обработка названия сервера"""
     await state.update_data(name=message.text)
-    await message.answer("Введите IP адрес сервера:")
-    await state.set_state(AddServerSteps.WAITING_IP)
-
-@dp.message(AddServerSteps.WAITING_IP)
-async def process_server_ip(message: Message, state: FSMContext):
-    """Обработка IP адреса"""
-    ip = message.text.strip()
-    await state.update_data(ip=ip)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔒 HTTPS (рекомендуется)", callback_data="protocol:https")],
-        [InlineKeyboardButton(text="🔓 HTTP", callback_data="protocol:http")]
-    ])
-    
     await message.answer(
-        "Выберите протокол подключения:",
-        reply_markup=keyboard
+        "🔗 Введите полную ссылку на панель 3x-ui:\n\n"
+        "Примеры:\n"
+        "• <code>http://79.137.204.85:8080/</code>\n"
+        "• <code>http://176.109.105.175:8080/YF0nOS5FD5nBM5MmWq/</code>\n"
+        "• <code>https://example.com:54321/</code>\n\n"
+        "⚠️ Важно: Укажите полную ссылку, включая протокол (http:// или https://), "
+        "адрес, порт и путь (если есть).",
+        parse_mode="HTML"
     )
-    await state.set_state(AddServerSteps.WAITING_PROTOCOL)
+    await state.set_state(AddServerSteps.WAITING_PANEL_URL)
 
-@dp.callback_query(AddServerSteps.WAITING_PROTOCOL, F.data.startswith("protocol:"))
-async def process_server_protocol(callback: CallbackQuery, state: FSMContext):
-    """Обработка выбора протокола"""
-    protocol = callback.data.split(":")[1]  # http или https
-    await state.update_data(protocol=protocol)
-    await callback.answer()
-    await callback.message.edit_text(
-        f"Протокол: <b>{protocol.upper()}</b>\n\n"
-        "Введите порт панели 3x-ui (по умолчанию 54321, нажмите Enter для использования стандартного):"
-    )
-    await state.set_state(AddServerSteps.WAITING_PORT)
-
-@dp.message(AddServerSteps.WAITING_PORT)
-async def process_server_port(message: Message, state: FSMContext):
-    """Обработка порта"""
-    port_text = message.text.strip()
-    if not port_text:
-        port = 54321  # Стандартный порт
-    else:
-        try:
-            port = int(port_text)
-            if port < 1 or port > 65535:
-                await message.answer("❌ Порт должен быть в диапазоне 1-65535. Попробуйте снова:")
-                return
-        except ValueError:
-            await message.answer("❌ Порт должен быть числом. Попробуйте снова:")
-            return
+@dp.message(AddServerSteps.WAITING_PANEL_URL)
+async def process_server_panel_url(message: Message, state: FSMContext):
+    """Обработка ссылки на панель"""
+    from urllib.parse import urlparse
     
-    data = await state.get_data()
-    ip = data.get('ip')
-    protocol = data.get('protocol', 'https')
-    base_url = f"{protocol}://{ip}:{port}"
-    await state.update_data(port=port, base_url=base_url)
-    await message.answer("Введите username для панели 3x-ui:")
-    await state.set_state(AddServerSteps.WAITING_USERNAME)
+    panel_url = message.text.strip()
+    
+    # Убеждаемся, что URL заканчивается на /
+    if not panel_url.endswith('/'):
+        panel_url += '/'
+    
+    # Парсим URL
+    try:
+        parsed = urlparse(panel_url)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError("Неверный формат URL")
+        
+        protocol = parsed.scheme.lower()
+        if protocol not in ['http', 'https']:
+            await message.answer("❌ Поддерживаются только протоколы HTTP и HTTPS. Попробуйте снова:")
+            return
+
+        # Извлекаем IP/домен и порт
+        netloc = parsed.netloc
+        if ':' in netloc:
+            host, port_str = netloc.rsplit(':', 1)
+            try:
+                port = int(port_str)
+            except ValueError:
+                await message.answer("❌ Неверный формат порта. Попробуйте снова:")
+                return
+        else:
+            # Если порт не указан, используем стандартный
+            host = netloc
+            port = 443 if protocol == 'https' else 80
+        
+        # Путь из URL
+        path = parsed.path
+        
+        # Формируем base_url (убираем путь из base_url, так как он будет использоваться в запросах)
+        # Но сохраняем полный URL для отображения
+        base_url = f"{protocol}://{host}:{port}{path}".rstrip('/')
+        
+        # Извлекаем IP или домен
+        ip_or_domain = host
+        
+        await state.update_data(
+            ip=ip_or_domain,
+            port=port,
+            protocol=protocol,
+            base_url=base_url,
+            panel_url=panel_url
+        )
+        
+        await message.answer(
+            f"✅ URL успешно распознан!\n\n"
+            f"<b>Данные:</b>\n"
+            f"Протокол: <i>{protocol.upper()}</i>\n"
+            f"Адрес: <i>{ip_or_domain}</i>\n"
+            f"Порт: <i>{port}</i>\n"
+            f"Путь: <i>{path if path else '/'}</i>\n"
+            f"Base URL: <i>{base_url}</i>\n\n"
+            f"Введите username для панели 3x-ui:",
+            parse_mode="HTML"
+        )
+        await state.set_state(AddServerSteps.WAITING_USERNAME)
+        
+    except Exception as e:
+        await message.answer(
+            f"❌ <b>Ошибка парсинга URL:</b>\n<code>{str(e)}</code>\n\n"
+            f"Пожалуйста, введите полную ссылку в формате:\n"
+            f"<code>http://IP:ПОРТ/ПУТЬ/</code>\n\n"
+            f"Пример: <code>http://79.137.204.85:8080/</code>",
+            parse_mode="HTML"
+        )
 
 @dp.message(AddServerSteps.WAITING_USERNAME)
 async def process_server_username(message: Message, state: FSMContext):
@@ -1203,7 +1234,8 @@ async def process_server_inbound_id(message: Message, state: FSMContext):
             f"Base URL: <i>{base_url}</i>\n"
             f"Username: <i>{username}</i>\n"
             f"Inbound ID: <i>{inbound_id}</i>\n\n"
-            f"Сохранить этот сервер? (да/нет)"
+            f"Сохранить этот сервер? (да/нет)",
+            parse_mode="HTML"
         )
         await state.update_data(inbound_id=inbound_id)
         await state.set_state(AddServerSteps.CONFIRMING)
@@ -1252,7 +1284,8 @@ async def process_server_confirmation(message: Message, state: FSMContext):
         f"✅ <b>Сервер успешно добавлен!</b>\n\n"
         f"ID: <i>{server_id}</i>\n"
         f"Название: <i>{name}</i>\n"
-        f"IP: <i>{ip}</i>"
+        f"IP: <i>{ip}</i>",
+        parse_mode="HTML"
     )
     await state.clear()
 
