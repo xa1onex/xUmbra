@@ -173,6 +173,8 @@ init_db(cfg.database.db_path)
 
 def get_main_keyboard(user_id: int):
     builder = InlineKeyboardBuilder()
+    if is_admin(user_id):
+        builder.row(InlineKeyboardButton(text="✏️ Редактировать объявление", callback_data="edit_announcement"))
     builder.row(
         InlineKeyboardButton(text="💳 Premium", callback_data="open_premium"),
         InlineKeyboardButton(text="🎁 Рефералка", callback_data="open_invite")
