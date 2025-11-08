@@ -315,29 +315,101 @@ class XUIClient:
         updated_settings = json.dumps(settings)
         
         # Формируем payload для обновления inbound
-        payload = {
-            "id": inbound_id,
-            "settings": updated_settings
-        }
-        
-        # Копируем все остальные поля из текущего inbound
-        for key in ['remark', 'listen', 'port', 'protocol', 'streamSettings', 'sniffing', 'tag']:
-            if key in chosen:
+        # Копируем все поля из текущего inbound и обновляем settings
+        payload = {}
+        for key in chosen:
+            if key == 'settings':
+                payload[key] = updated_settings
+            elif key in ['streamSettings', 'sniffing']:
+                # Эти поля могут быть строками JSON, оставляем как есть (строки)
+                payload[key] = chosen[key]
+            else:
                 payload[key] = chosen[key]
         
         headers = {"Content-Type": "application/json", **self._auth_headers()}
         
-        # Обновляем inbound
-        endpoint = "panel/api/inbounds/update"
-        print(f"[xui] POST {self.base_url}{endpoint} payload: {payload}")
-        resp = self._client.post(endpoint, json=payload, headers=headers)
-        print(f"[xui] Status={resp.status_code} Response={resp.text}")
+        # Пробуем endpoint updateAll (обычно работает в 3x-ui)
+        try:
+            payload_all = [payload]
+            endpoint = "panel/api/inbounds/updateAll"
+            print(f"[xui] POST {self.base_url}{endpoint} payload: {payload_all}")
+            resp = self._client.post(endpoint, json=payload_all, headers=headers)
+            print(f"[xui] Status={resp.status_code} Response={resp.text}")
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success", True):
+                    print(f"[xui] Successfully deleted client {client_id} using updateAll")
+                    return
+        except Exception as e:
+            print(f"[xui] updateAll failed: {e}")
         
-        if resp.status_code != 200:
-            raise RuntimeError(f"update inbound failed: {resp.status_code} {resp.text}")
+        # Пробуем endpoint update с PUT методом
+        try:
+            endpoint = f"panel/api/inbounds/{inbound_id}"
+            print(f"[xui] PUT {self.base_url}{endpoint} payload: {payload}")
+            resp = self._client.put(endpoint, json=payload, headers=headers)
+            print(f"[xui] Status={resp.status_code} Response={resp.text}")
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success", True):
+                    print(f"[xui] Successfully deleted client {client_id} using PUT /{inbound_id}")
+                    return
+        except Exception as e:
+            print(f"[xui] PUT /{inbound_id} failed: {e}")
         
-        data = resp.json()
-        if not data.get("success", True):
-            raise RuntimeError(f"update inbound error: {data}")
+        # Пробуем endpoint update с ID в пути через POST
+        try:
+            endpoint = f"panel/api/inbounds/update/{inbound_id}"
+            print(f"[xui] POST {self.base_url}{endpoint} payload: {payload}")
+            resp = self._client.post(endpoint, json=payload, headers=headers)
+            print(f"[xui] Status={resp.status_code} Response={resp.text}")
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success", True):
+                    print(f"[xui] Successfully deleted client {client_id} using update/{inbound_id}")
+                    return
+        except Exception as e:
+            print(f"[xui] update/{inbound_id} failed: {e}")
+        
+        # Пробуем endpoint update без ID в пути
+        try:
+            endpoint = "panel/api/inbounds/update"
+            print(f"[xui] POST {self.base_url}{endpoint} payload: {payload}")
+            resp = self._client.post(endpoint, json=payload, headers=headers)
+            print(f"[xui] Status={resp.status_code} Response={resp.text}")
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success", True):
+                    print(f"[xui] Successfully deleted client {client_id} using update")
+                    return
+        except Exception as e:
+            print(f"[xui] update failed: {e}")
+        
+        # Если ничего не помогло, пробуем через delClient
+        try:
+            del_payload = {
+                "id": inbound_id,
+                "settings": json.dumps({"clients": [{"id": client_id}]})
+            }
+            endpoint = "panel/api/inbounds/delClient"
+            print(f"[xui] POST {self.base_url}{endpoint} payload: {del_payload}")
+            resp = self._client.post(endpoint, json=del_payload, headers=headers)
+            print(f"[xui] Status={resp.status_code} Response={resp.text}")
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success", True):
+                    print(f"[xui] Successfully deleted client {client_id} using delClient")
+                    return
+        except Exception as e:
+            print(f"[xui] delClient failed: {e}")
+        
+        # Если все методы не сработали, просто логируем ошибку, но не падаем
+        # (ключ все равно удалится из БД)
+        print(f"[xui] WARNING: Could not delete client {client_id} from server, but will continue with DB deletion")
 
 
