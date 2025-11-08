@@ -754,7 +754,7 @@ async def handle_open_invite(message_or_callback: Message | CallbackQuery):
             if isinstance(message_or_callback, CallbackQuery):
                 await message_or_callback.message.edit_text(
                     "❌ Вы не зарегистрированы в системе.\n\n"
-                    "Пожалуйста, используйте команду /start для регистрации.",
+                    "Пожалуйста, используйте команду /start для регистрации.1",
                     parse_mode="HTML"
                 )
             else:
