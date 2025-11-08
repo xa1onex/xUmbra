@@ -91,6 +91,8 @@ def init_db(db_path: str = DATABASE_FILE):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 ip TEXT NOT NULL,
+                port INTEGER DEFAULT 54321,
+                protocol TEXT DEFAULT 'https',
                 username TEXT,
                 password TEXT,
                 inbound_id INTEGER NOT NULL,
@@ -100,6 +102,24 @@ def init_db(db_path: str = DATABASE_FILE):
                 updated_at TEXT
             )
         ''')
+        
+        # Проверяем и добавляем колонки protocol и port, если их нет
+        cursor.execute("PRAGMA table_info(servers)")
+        server_columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'protocol' not in server_columns:
+            try:
+                cursor.execute('ALTER TABLE servers ADD COLUMN protocol TEXT DEFAULT "https"')
+                logging.info("Added protocol column to servers table")
+            except Exception as e:
+                logging.warning(f"Could not add protocol column: {e}")
+        
+        if 'port' not in server_columns:
+            try:
+                cursor.execute('ALTER TABLE servers ADD COLUMN port INTEGER DEFAULT 54321')
+                logging.info("Added port column to servers table")
+            except Exception as e:
+                logging.warning(f"Could not add port column: {e}")
 
         conn.commit()
 

@@ -116,6 +116,7 @@ class SubscriptionSteps(StatesGroup):
 class AddServerSteps(StatesGroup):
     WAITING_NAME = State()
     WAITING_IP = State()
+    WAITING_PROTOCOL = State()
     WAITING_PORT = State()
     WAITING_USERNAME = State()
     WAITING_PASSWORD = State()
@@ -741,7 +742,14 @@ async def process_successful_payment(message: Message):
         if not server_data:
             raise ValueError(f"Сервер {server_id} не найден")
         
-        server_id_db, server_name, server_ip, server_username, server_password, server_inbound_id, server_base_url = server_data
+        # Распаковываем данные сервера (может быть старый формат без port и protocol)
+        if len(server_data) >= 9:
+            server_id_db, server_name, server_ip, server_port, server_protocol, server_username, server_password, server_inbound_id, server_base_url = server_data
+        else:
+            # Старый формат (без port и protocol)
+            server_id_db, server_name, server_ip, server_username, server_password, server_inbound_id, server_base_url = server_data
+            server_port = 54321
+            server_protocol = 'https'
         
         # Создаем клиент для конкретного сервера
         try:
@@ -1096,7 +1104,28 @@ async def process_server_ip(message: Message, state: FSMContext):
     """Обработка IP адреса"""
     ip = message.text.strip()
     await state.update_data(ip=ip)
-    await message.answer("Введите порт панели 3x-ui (по умолчанию 54321, нажмите Enter для использования стандартного):")
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔒 HTTPS (рекомендуется)", callback_data="protocol:https")],
+        [InlineKeyboardButton(text="🔓 HTTP", callback_data="protocol:http")]
+    ])
+    
+    await message.answer(
+        "Выберите протокол подключения:",
+        reply_markup=keyboard
+    )
+    await state.set_state(AddServerSteps.WAITING_PROTOCOL)
+
+@dp.callback_query(AddServerSteps.WAITING_PROTOCOL, F.data.startswith("protocol:"))
+async def process_server_protocol(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора протокола"""
+    protocol = callback.data.split(":")[1]  # http или https
+    await state.update_data(protocol=protocol)
+    await callback.answer()
+    await callback.message.edit_text(
+        f"Протокол: <b>{protocol.upper()}</b>\n\n"
+        "Введите порт панели 3x-ui (по умолчанию 54321, нажмите Enter для использования стандартного):"
+    )
     await state.set_state(AddServerSteps.WAITING_PORT)
 
 @dp.message(AddServerSteps.WAITING_PORT)
@@ -1114,10 +1143,11 @@ async def process_server_port(message: Message, state: FSMContext):
         except ValueError:
             await message.answer("❌ Порт должен быть числом. Попробуйте снова:")
             return
-
+    
     data = await state.get_data()
     ip = data.get('ip')
-    base_url = f"https://{ip}:{port}"
+    protocol = data.get('protocol', 'https')
+    base_url = f"{protocol}://{ip}:{port}"
     await state.update_data(port=port, base_url=base_url)
     await message.answer("Введите username для панели 3x-ui:")
     await state.set_state(AddServerSteps.WAITING_USERNAME)
@@ -1148,6 +1178,8 @@ async def process_server_inbound_id(message: Message, state: FSMContext):
     data = await state.get_data()
     name = data.get('name')
     ip = data.get('ip')
+    port = data.get('port', 54321)
+    protocol = data.get('protocol', 'https')
     username = data.get('username')
     password = data.get('password')
     base_url = data.get('base_url')
@@ -1166,6 +1198,8 @@ async def process_server_inbound_id(message: Message, state: FSMContext):
             f"<b>Данные сервера:</b>\n"
             f"Название: <i>{name}</i>\n"
             f"IP: <i>{ip}</i>\n"
+            f"Протокол: <i>{protocol.upper()}</i>\n"
+            f"Порт: <i>{port}</i>\n"
             f"Base URL: <i>{base_url}</i>\n"
             f"Username: <i>{username}</i>\n"
             f"Inbound ID: <i>{inbound_id}</i>\n\n"
@@ -1174,9 +1208,15 @@ async def process_server_inbound_id(message: Message, state: FSMContext):
         await state.update_data(inbound_id=inbound_id)
         await state.set_state(AddServerSteps.CONFIRMING)
     except Exception as e:
+        error_msg = str(e)
+        # Предлагаем попробовать другой протокол при SSL ошибке
+        if "SSL" in error_msg or "WRONG_VERSION_NUMBER" in error_msg:
+            suggestion = "\n\n💡 <b>Совет:</b> Попробуйте использовать HTTP вместо HTTPS. Используйте /add_server для повторного ввода."
+        else:
+            suggestion = "\n\nПроверьте данные и попробуйте снова. Используйте /add_server для повторного ввода."
+        
         await message.answer(
-            f"❌ <b>Ошибка подключения к серверу:</b>\n<code>{str(e)}</code>\n\n"
-            f"Проверьте данные и попробуйте снова. Используйте /add_server для повторного ввода."
+            f"❌ <b>Ошибка подключения к серверу:</b>\n<code>{error_msg}</code>{suggestion}"
         )
         await state.clear()
 
@@ -1191,6 +1231,8 @@ async def process_server_confirmation(message: Message, state: FSMContext):
     data = await state.get_data()
     name = data.get('name')
     ip = data.get('ip')
+    port = data.get('port', 54321)
+    protocol = data.get('protocol', 'https')
     username = data.get('username')
     password = data.get('password')
     base_url = data.get('base_url')
@@ -1200,9 +1242,9 @@ async def process_server_confirmation(message: Message, state: FSMContext):
     with get_connection(cfg.database.db_path) as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO servers (name, ip, username, password, inbound_id, base_url, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, TRUE)
-        ''', (name, ip, username, password, inbound_id, base_url))
+            INSERT INTO servers (name, ip, port, protocol, username, password, inbound_id, base_url, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+        ''', (name, ip, port, protocol, username, password, inbound_id, base_url))
         conn.commit()
         server_id = cursor.lastrowid
     

@@ -54,7 +54,14 @@ class XUIClient:
             self.api_token = api_token
             self.inbound_id = inbound_id
         
-        self._client = httpx.Client(base_url=self.base_url, timeout=20.0, verify=False)
+        # Определяем, нужно ли использовать SSL
+        use_ssl = self.base_url.startswith('https://')
+        self._client = httpx.Client(
+            base_url=self.base_url, 
+            timeout=20.0, 
+            verify=False,
+            follow_redirects=True
+        )
         self._authorized = False
 
     def _auth_headers(self) -> dict[str, str]:
