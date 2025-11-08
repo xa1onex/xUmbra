@@ -139,25 +139,25 @@ def get_main_keyboard(user_id: int):
     )
     return builder.as_markup()
 
-def get_main_text(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    first_name = callback.from_user.first_name or "Пользователь"
-
-    # Получаем статус подписки
+def get_subscription_status(user_id: int) -> str:
+    """Получает статус подписки пользователя"""
     with get_connection(cfg.database.db_path) as conn:
         cursor = conn.cursor()
         cursor.execute('''
-                SELECT subscription_end, pay_subscribed 
-                FROM users 
-                WHERE user_id = ?
-            ''', (user_id,))
+            SELECT subscription_end, pay_subscribed 
+            FROM users 
+            WHERE user_id = ?
+        ''', (user_id,))
         user_data = cursor.fetchone()
 
-        subscription_status = "неактивен"
         if user_data and user_data[1] == 1 and user_data[0]:
             end_date = datetime.strptime(user_data[0], "%Y-%m-%d")
             if end_date >= datetime.now():
-                subscription_status = f"активен до {end_date.strftime('%d.%m.%Y')}"
+                return f"активен до {end_date.strftime('%d.%m.%Y')}"
+    return "неактивен"
+
+def get_main_text(first_name: str, subscription_status: str) -> str:
+    """Возвращает основной текст"""
     return (
         f"👋 Рады видеть тебя снова, <b>{first_name}</b>!\n\n"
         f"<b>VPN</b>: <i>{subscription_status}</i>\n\n"
@@ -166,7 +166,7 @@ def get_main_text(callback: CallbackQuery):
         "<i>/prem</i> - Покупка VPN\n"
         "<i>/invite</i> - Пригласи друга\n\n"
         "<code>!!!ВНИМАНИЕ!!! Это бета-тест, VPN работает нестабильно, платежи также находятся в тестировании - они не реальны!!!\n"
-        "b1.1.6</code>"
+        "b1.1.7</code>"
     )
 
 @dp.message(CommandStart())
@@ -997,26 +997,11 @@ async def go_back_handler(callback: CallbackQuery):
     """Обработчик кнопки Назад"""
     user_id = callback.from_user.id
     first_name = callback.from_user.first_name or "Пользователь"
+    subscription_status = get_subscription_status(user_id)
 
-    # Получаем статус подписки
-    with get_connection(cfg.database.db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT subscription_end, pay_subscribed 
-            FROM users 
-            WHERE user_id = ?
-        ''', (user_id,))
-        user_data = cursor.fetchone()
-
-        subscription_status = "неактивен"
-        if user_data and user_data[1] == 1 and user_data[0]:
-            end_date = datetime.strptime(user_data[0], "%Y-%m-%d")
-            if end_date >= datetime.now():
-                subscription_status = f"активен до {end_date.strftime('%d.%m.%Y')}"
-    
     await callback.message.edit_text(
-        text = get_main_text(first_name, subscription_status),
-        parse_mode='HTML', 
+        text=get_main_text(first_name, subscription_status),
+        parse_mode='HTML',
         reply_markup=get_main_keyboard(user_id)
     )
     await callback.answer()
