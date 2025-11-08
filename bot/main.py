@@ -1418,6 +1418,9 @@ async def handle_key_server_selection(callback: CallbackQuery, state: FSMContext
                         logger.error(f"Failed to delete old client from server: {e}")
                         # Продолжаем работу даже если не удалось удалить старый клиент
         
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="◀️ Назад к ключам", callback_data="manage_keys"))
+        
         await callback.message.edit_text(
             f"✅ <b>Ключ успешно {'заменен' if key_to_replace else 'создан'}!</b>\n\n"
             f"<b>Информация:</b>\n"
@@ -1427,7 +1430,8 @@ async def handle_key_server_selection(callback: CallbackQuery, state: FSMContext
             f"🔗 <b>VPN ссылка:</b>\n"
             f"<code>{vless_link}</code>\n\n"
             f"Используйте раздел <b>🔑 Мои ключи</b> для управления ключами.",
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=builder.as_markup()
         )
         await callback.answer()
         
