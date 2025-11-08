@@ -49,6 +49,14 @@ def init_db(db_path: str = DATABASE_FILE):
                 logging.info("Added vless_link column to users table")
             except Exception as e:
                 logging.warning(f"Could not add vless_link column: {e}")
+        
+        # Добавляем server_id в таблицу users
+        if 'server_id' not in columns:
+            try:
+                cursor.execute('ALTER TABLE users ADD COLUMN server_id INTEGER')
+                logging.info("Added server_id column to users table")
+            except Exception as e:
+                logging.warning(f"Could not add server_id column: {e}")
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS subscriptions (
@@ -75,6 +83,21 @@ def init_db(db_path: str = DATABASE_FILE):
                 status TEXT,
                 telegram_payment_charge_id TEXT,
                 FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS servers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                ip TEXT NOT NULL,
+                username TEXT,
+                password TEXT,
+                inbound_id INTEGER NOT NULL,
+                base_url TEXT NOT NULL,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT
             )
         ''')
 

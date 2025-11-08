@@ -36,25 +36,41 @@ class VlessClient:
 
 
 class XUIClient:
-    def __init__(self, cfg: XUIConfig) -> None:
-        self.cfg = cfg
-        self._client = httpx.Client(base_url=cfg.base_url, timeout=20.0, verify=False)
+    def __init__(self, cfg: XUIConfig = None, base_url: str = None, username: str = None, 
+                 password: str = None, api_token: str = None, inbound_id: int = None) -> None:
+        """Инициализация клиента. Можно использовать cfg или отдельные параметры сервера"""
+        if cfg:
+            self.base_url = cfg.base_url
+            self.username = cfg.username
+            self.password = cfg.password
+            self.api_token = cfg.api_token
+            self.inbound_id = cfg.inbound_id
+        else:
+            if not base_url:
+                raise ValueError("Either cfg or base_url must be provided")
+            self.base_url = base_url.rstrip("/") if base_url else None
+            self.username = username
+            self.password = password
+            self.api_token = api_token
+            self.inbound_id = inbound_id
+        
+        self._client = httpx.Client(base_url=self.base_url, timeout=20.0, verify=False)
         self._authorized = False
 
     def _auth_headers(self) -> dict[str, str]:
-        if self.cfg.api_token:
-            return {"Authorization": f"Bearer {self.cfg.api_token}"}
+        if self.api_token:
+            return {"Authorization": f"Bearer {self.api_token}"}
         return {}
 
     def login(self) -> None:
-        if self.cfg.api_token:
+        if self.api_token:
             self._authorized = True
             return
-        if not (self.cfg.username and self.cfg.password):
-            raise RuntimeError("Either XUI_API_TOKEN or XUI_USERNAME/XUI_PASSWORD must be provided")
+        if not (self.username and self.password):
+            raise RuntimeError("Either API_TOKEN or USERNAME/PASSWORD must be provided")
         # Try common 3x-ui login route
         resp = self._client.post(
-            "/login", data={"username": self.cfg.username, "password": self.cfg.password}
+            "/login", data={"username": self.username, "password": self.password}
         )
         if resp.status_code not in (200, 302):
             raise RuntimeError(f"x-ui login failed: {resp.status_code} {resp.text}")
@@ -95,7 +111,9 @@ class XUIClient:
             "subId": "",
             "flow": "xtls-rprx-vision",
         }
-        inbound_id = self.cfg.inbound_id
+        inbound_id = self.inbound_id
+        if not inbound_id:
+            raise RuntimeError("inbound_id is not set")
         payload = {
             "id": inbound_id,
             "settings": json.dumps({"clients": [client_dict]})

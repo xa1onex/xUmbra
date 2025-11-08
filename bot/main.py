@@ -111,6 +111,16 @@ POLICY_LINK = "https://telegra.ph/Konfidencialnost-i-usloviya-02-01"
 class SubscriptionSteps(StatesGroup):
     CHOOSING_PLAN = State()
     CHOOSING_PAYMENT_METHOD = State()
+    CHOOSING_SERVER = State()
+
+class AddServerSteps(StatesGroup):
+    WAITING_NAME = State()
+    WAITING_IP = State()
+    WAITING_PORT = State()
+    WAITING_USERNAME = State()
+    WAITING_PASSWORD = State()
+    WAITING_INBOUND_ID = State()
+    CONFIRMING = State()
 
 cfg = load_config()
 bot = Bot(token=cfg.bot.bot_token)
@@ -534,7 +544,78 @@ async def select_plan(callback: CallbackQuery, state: FSMContext):
         selected_plan_data=plan_data,
         is_renewal=is_renewal
     )
+    
+    # Проверяем, есть ли активные серверы
+    active_servers = get_active_servers()
+    if not active_servers:
+        await callback.answer("❌ Нет доступных серверов. Обратитесь к администратору.", show_alert=True)
+        return
+    
+    # Если это продление и у пользователя уже есть сервер - используем его
+    if is_renewal:
+        with get_connection(cfg.database.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT server_id FROM users WHERE user_id = ?', (user_id,))
+            result = cursor.fetchone()
+            if result and result[0]:
+                # Используем существующий сервер
+                server_id = result[0]
+                # Проверяем, что сервер активен
+                server_data = get_server_by_id(server_id)
+                if server_data and any(s[0] == server_id for s in active_servers):
+                    await state.update_data(selected_server_id=server_id)
+                    # Переходим к выбору метода оплаты
+                    await show_payment_methods(callback, state)
+                    return
+    
+    # Показываем выбор сервера
+    builder = InlineKeyboardBuilder()
+    text = f"🖥️ <b>Выберите сервер</b>\n\n"
+    text += f"План: <b>{plan_data['title']}</b>\n"
+    text += f"Цена: {plan_data['price_rub'] // 100}₽ | {plan_data['price_stars']}⭐\n\n"
+    text += "Выберите сервер для подключения:\n"
+    
+    for server_id, name, ip, _ in active_servers:
+        builder.button(
+            text=f"🖥️ {name} ({ip})",
+            callback_data=f"server:{server_id}"
+        )
+    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="sub_back_to_plan"))
+    
+    await callback.message.edit_text(
+        text,
+        reply_markup=builder.as_markup(),
+        parse_mode="HTML"
+    )
+    await state.set_state(SubscriptionSteps.CHOOSING_SERVER)
+    await callback.answer()
 
+@dp.callback_query(SubscriptionSteps.CHOOSING_SERVER, F.data.startswith("server:"))
+async def select_server(callback: CallbackQuery, state: FSMContext):
+    """Обработчик выбора сервера"""
+    server_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+    
+    # Проверяем, что сервер активен
+    server_data = get_server_by_id(server_id)
+    if not server_data:
+        await callback.answer("❌ Сервер не найден", show_alert=True)
+        return
+    
+    active_servers = get_active_servers()
+    if not any(s[0] == server_id for s in active_servers):
+        await callback.answer("❌ Сервер неактивен", show_alert=True)
+        return
+    
+    await state.update_data(selected_server_id=server_id)
+    await show_payment_methods(callback, state)
+
+async def show_payment_methods(callback: CallbackQuery, state: FSMContext):
+    """Показать методы оплаты"""
+    data = await state.get_data()
+    plan_data = data.get('selected_plan_data')
+    
     builder = InlineKeyboardBuilder()
     for method_id, method_data in PAYMENT_METHODS.items():
         builder.button(
@@ -569,7 +650,19 @@ async def process_payment(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Ошибка данных")
         return
 
-    payload = f"{plan_id}|{method_id}"
+    # Получаем выбранный сервер из состояния
+    data = await state.get_data()
+    server_id = data.get('selected_server_id')
+    if not server_id:
+        # Если сервер не выбран, берем первый активный
+        active_servers = get_active_servers()
+        if active_servers:
+            server_id = active_servers[0][0]
+        else:
+            await callback.answer("❌ Нет доступных серверов", show_alert=True)
+            return
+
+    payload = f"{plan_id}|{method_id}|{server_id}"
 
     currency_type = 'stars' if PAYMENT_METHODS[method_id]['currency'] == 'XTR' else 'rub'
     price = plan_data[f"price_{currency_type}"]
@@ -597,128 +690,163 @@ async def process_successful_payment(message: Message):
             raise ValueError("Неверный формат платежа")
 
         parts = payload.split("|")
-        if len(parts) != 2:
+        if len(parts) < 2:
             raise ValueError("Неверный формат payload")
+        
+        # Обработка подписки
+        plan_id = parts[0]
+        method_id = parts[1]
+        server_id_from_payload = int(parts[2]) if len(parts) > 2 else None
+
+        # Определение типа подписки
+        if plan_id in SUBSCRIPTION_PLANS:
+            plan_data = SUBSCRIPTION_PLANS[plan_id]
+            is_new_subscription = True
+        elif plan_id in RENEWAL_PLANS:
+            plan_data = RENEWAL_PLANS[plan_id]
+            is_new_subscription = False
         else:
-            # Обработка подписки
-            plan_id, method_id = payload.split("|")
+            raise ValueError(f"Неизвестный план: {plan_id}")
 
-            # Определение типа подписки
-            if plan_id in SUBSCRIPTION_PLANS:
-                plan_data = SUBSCRIPTION_PLANS[plan_id]
-                is_new_subscription = True
-            elif plan_id in RENEWAL_PLANS:
-                plan_data = RENEWAL_PLANS[plan_id]
-                is_new_subscription = False
-            else:
-                raise ValueError(f"Неизвестный план: {plan_id}")
+        # Валидация метода оплаты
+        if method_id not in PAYMENT_METHODS:
+            raise ValueError(f"Неизвестный метод оплаты: {method_id}")
 
-            # Валидация метода оплаты
-            if method_id not in PAYMENT_METHODS:
-                raise ValueError(f"Неизвестный метод оплаты: {method_id}")
+        method_data = PAYMENT_METHODS[method_id]
+        duration_months = plan_data['duration']
+        traffic_gb = plan_data['traffic_gb']
 
-            method_data = PAYMENT_METHODS[method_id]
-            duration_months = plan_data['duration']
-            traffic_gb = plan_data['traffic_gb']
-
-            user_id = message.from_user.id
-            username = message.from_user.username or f"user_{user_id}"
-            
-            # Создаем VPN подключение
-            try:
-                result = xui_client.add_vless_client(
-                    telegram_user_id=user_id,
-                    display_name=username,
-                traffic_gb=traffic_gb,
-                    days_valid=duration_months * 30,
-                )
-                vless_client_id = result.get("id")
-                vless_link = result.get("link")
-            except Exception as e:
-                logger.error(f"Failed to create x-ui client: {e}")
-                raise ValueError(f"Ошибка при создании VPN подключения: {e}")
-
-            # Обновление подписки в базе данных
+        user_id = message.from_user.id
+        username = message.from_user.username or f"user_{user_id}"
+        
+        # Получаем выбранный сервер
+        # Приоритет: из payload > из БД пользователя > первый активный
+        server_id = server_id_from_payload
+        if not server_id:
             with get_connection(cfg.database.db_path) as conn:
                 cursor = conn.cursor()
-
-                if is_new_subscription:
-                    # Новая подписка
-                    cursor.execute('''
-                        UPDATE users 
-                        SET 
-                            pay_subscribed = 1,
-                            subscription_end = DATE('now', ?),
-                            renewal_used = 0,
-                            vless_client_id = ?,
-                            vless_link = ?
-                        WHERE user_id = ?
-                    ''', (f"+{duration_months} months", vless_client_id, vless_link, user_id))
-                else:
-                    # Продление существующей подписки
-                    cursor.execute('''
-                        UPDATE users 
-                        SET 
-                            subscription_end = DATE(subscription_end, ?),
-                            renewal_used = 1,
-                            vless_client_id = ?,
-                            vless_link = ?
-                        WHERE user_id = ?
-                    ''', (f"+{duration_months} months", vless_client_id, vless_link, user_id))
-
-                # Получаем обновленную дату окончания
-                cursor.execute('''
-                    SELECT subscription_end FROM users WHERE user_id = ?
-                ''', (user_id,))
-                subscription_end = cursor.fetchone()[0]
-                
-                # Сохраняем платеж
-                cursor.execute('''
-                    INSERT INTO payments (user_id, amount, currency, plan_id, plan_type, status, telegram_payment_charge_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    user_id,
-                    plan_data[f"price_{'stars' if method_data['currency'] == 'XTR' else 'rub'}"],
-                    method_data['currency'],
-                    plan_id,
-                    'subscription',
-                    'completed',
-                    message.successful_payment.telegram_payment_charge_id
-                ))
-                
-                conn.commit()
-
-            # Форматирование дат
-            activation_date = datetime.now().strftime("%d.%m.%Y")
-            end_date = datetime.strptime(subscription_end, "%Y-%m-%d").strftime("%d.%m.%Y")
-
-            # Форматирование цены
-            price_key = f"price_{'stars' if method_data['currency'] == 'XTR' else 'rub'}"
-            price = plan_data[price_key]
-
-            if method_data['currency'] == 'XTR':
-                formatted_price = f"{price} Stars (≈ {price * 0.01:.2f}₽)"
-            else:
-                formatted_price = f"{price // 100}₽"
-
-            # Формирование квитанции
-            receipt = (
-                f"💳 <b>VPN</b> успешно активирован!\n\n"
-                f"<b>Чек на оплату</b>\n"
-                f"Дата активации: <i>{activation_date}</i>\n"
-                f"Дата окончания: <i>{end_date}</i>\n"
-                f"Способ оплаты: <i>{method_data['title']}</i>\n"
-                f"Сумма оплаты: <i>{formatted_price}</i>\n\n"
-                f"<b>Детали VPN</b>:\n"
-                f"• План: <i>{plan_data['title']}</i>\n"
-                f"• Трафик: <i>{traffic_gb} ГБ</i>\n"
-                f"• Срок: <i>{duration_months} месяцев</i>\n\n"
-                f"🔗 <b>Ваша VPN ссылка:</b>\n"
-                f"<code>{vless_link}</code>\n\n"
-                f"ID транзакции: <blockquote>{message.successful_payment.telegram_payment_charge_id}</blockquote>"
+                cursor.execute('SELECT server_id FROM users WHERE user_id = ?', (user_id,))
+                result_user = cursor.fetchone()
+                server_id = result_user[0] if result_user and result_user[0] else None
+            
+            # Если сервер не найден, берем первый активный
+            if not server_id:
+                active_servers = get_active_servers()
+                if not active_servers:
+                    raise ValueError("Нет доступных серверов")
+                server_id = active_servers[0][0]
+        
+        # Получаем данные сервера
+        server_data = get_server_by_id(server_id)
+        if not server_data:
+            raise ValueError(f"Сервер {server_id} не найден")
+        
+        server_id_db, server_name, server_ip, server_username, server_password, server_inbound_id, server_base_url = server_data
+        
+        # Создаем клиент для конкретного сервера
+        try:
+            server_client = XUIClient(
+                base_url=server_base_url,
+                username=server_username,
+                password=server_password,
+                inbound_id=server_inbound_id
             )
+            result = server_client.add_vless_client(
+                telegram_user_id=user_id,
+                display_name=username,
+                traffic_gb=traffic_gb,
+                days_valid=duration_months * 30,
+            )
+            vless_client_id = result.get("id")
+            vless_link = result.get("link")
+        except Exception as e:
+            logger.error(f"Failed to create x-ui client on server {server_id}: {e}")
+            raise ValueError(f"Ошибка при создании VPN подключения на сервере {server_name}: {e}")
 
-            await message.answer(receipt, parse_mode='HTML')
+        # Обновление подписки в базе данных
+        with get_connection(cfg.database.db_path) as conn:
+            cursor = conn.cursor()
+
+            if is_new_subscription:
+                # Новая подписка
+                days = duration_months * 30
+                cursor.execute('''
+                    UPDATE users 
+                    SET 
+                        pay_subscribed = 1,
+                        server_id = ?,
+                        vless_client_id = ?,
+                        vless_link = ?,
+                        subscription_end = DATE('now', '+' || ? || ' days'),
+                        renewal_used = 0
+                    WHERE user_id = ?
+                ''', (server_id, vless_client_id, vless_link, days, user_id))
+            else:
+                # Продление существующей подписки
+                cursor.execute('''
+                    UPDATE users 
+                    SET 
+                        subscription_end = DATE(subscription_end, ?),
+                        renewal_used = 1,
+                        vless_client_id = ?,
+                        vless_link = ?
+                    WHERE user_id = ?
+                ''', (f"+{duration_months} months", vless_client_id, vless_link, user_id))
+
+            # Получаем обновленную дату окончания
+            cursor.execute('''
+                SELECT subscription_end FROM users WHERE user_id = ?
+            ''', (user_id,))
+            subscription_end = cursor.fetchone()[0]
+            
+            # Сохраняем платеж
+            cursor.execute('''
+                INSERT INTO payments (user_id, amount, currency, plan_id, plan_type, status, telegram_payment_charge_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                user_id,
+                plan_data[f"price_{'stars' if method_data['currency'] == 'XTR' else 'rub'}"],
+                method_data['currency'],
+                plan_id,
+                'subscription',
+                'completed',
+                message.successful_payment.telegram_payment_charge_id
+            ))
+            
+            conn.commit()
+
+        # Форматирование дат
+        activation_date = datetime.now().strftime("%d.%m.%Y")
+        end_date = datetime.strptime(subscription_end, "%Y-%m-%d").strftime("%d.%m.%Y")
+
+        # Форматирование цены
+        price_key = f"price_{'stars' if method_data['currency'] == 'XTR' else 'rub'}"
+        price = plan_data[price_key]
+
+        if method_data['currency'] == 'XTR':
+            formatted_price = f"{price} Stars (≈ {price * 0.01:.2f}₽)"
+        else:
+            formatted_price = f"{price // 100}₽"
+
+        # Формирование квитанции
+        receipt = (
+            f"💳 <b>VPN</b> успешно активирован!\n\n"
+            f"<b>Чек на оплату</b>\n"
+            f"Дата активации: <i>{activation_date}</i>\n"
+            f"Дата окончания: <i>{end_date}</i>\n"
+            f"Способ оплаты: <i>{method_data['title']}</i>\n"
+            f"Сумма оплаты: <i>{formatted_price}</i>\n\n"
+            f"<b>Детали VPN</b>:\n"
+            f"• План: <i>{plan_data['title']}</i>\n"
+            f"• Сервер: <i>{server_name}</i>\n"
+            f"• Трафик: <i>{traffic_gb} ГБ</i>\n"
+            f"• Срок: <i>{duration_months} месяцев</i>\n\n"
+            f"🔗 <b>Ваша VPN ссылка:</b>\n"
+            f"<code>{vless_link}</code>\n\n"
+            f"ID транзакции: <blockquote>{message.successful_payment.telegram_payment_charge_id}</blockquote>"
+        )
+
+        await message.answer(receipt, parse_mode='HTML')
 
     except Exception as e:
         logging.error(f"Ошибка обработки платежа: {str(e)}", exc_info=True)
@@ -913,6 +1041,290 @@ async def handle_open_help(message_or_callback: Message | CallbackQuery):
             reply_markup=report_button,
             parse_mode="HTML"
         )
+
+def is_admin(user_id: int) -> bool:
+    """Проверка, является ли пользователь админом"""
+    return user_id in cfg.bot.admin_ids
+
+def get_active_servers():
+    """Получить список активных серверов"""
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, name, ip, inbound_id 
+            FROM servers 
+            WHERE is_active = TRUE
+            ORDER BY name
+        ''')
+        return cursor.fetchall()
+
+def get_server_by_id(server_id: int):
+    """Получить данные сервера по ID"""
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, name, ip, username, password, inbound_id, base_url
+            FROM servers 
+            WHERE id = ?
+        ''', (server_id,))
+        return cursor.fetchone()
+
+# ==================== АДМИНСКИЕ КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ СЕРВЕРАМИ ====================
+
+@dp.message(Command("add_server"))
+async def cmd_add_server(message: Message, state: FSMContext):
+    """Команда для добавления нового сервера"""
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет доступа к этой команде.")
+        return
+    
+    await message.answer(
+        "🔧 <b>Добавление нового сервера</b>\n\n"
+        "Введите название сервера (будет видно пользователям):"
+    )
+    await state.set_state(AddServerSteps.WAITING_NAME)
+
+@dp.message(AddServerSteps.WAITING_NAME)
+async def process_server_name(message: Message, state: FSMContext):
+    """Обработка названия сервера"""
+    await state.update_data(name=message.text)
+    await message.answer("Введите IP адрес сервера:")
+    await state.set_state(AddServerSteps.WAITING_IP)
+
+@dp.message(AddServerSteps.WAITING_IP)
+async def process_server_ip(message: Message, state: FSMContext):
+    """Обработка IP адреса"""
+    ip = message.text.strip()
+    await state.update_data(ip=ip)
+    await message.answer("Введите порт панели 3x-ui (по умолчанию 54321, нажмите Enter для использования стандартного):")
+    await state.set_state(AddServerSteps.WAITING_PORT)
+
+@dp.message(AddServerSteps.WAITING_PORT)
+async def process_server_port(message: Message, state: FSMContext):
+    """Обработка порта"""
+    port_text = message.text.strip()
+    if not port_text:
+        port = 54321  # Стандартный порт
+    else:
+        try:
+            port = int(port_text)
+            if port < 1 or port > 65535:
+                await message.answer("❌ Порт должен быть в диапазоне 1-65535. Попробуйте снова:")
+                return
+        except ValueError:
+            await message.answer("❌ Порт должен быть числом. Попробуйте снова:")
+            return
+
+    data = await state.get_data()
+    ip = data.get('ip')
+    base_url = f"https://{ip}:{port}"
+    await state.update_data(port=port, base_url=base_url)
+    await message.answer("Введите username для панели 3x-ui:")
+    await state.set_state(AddServerSteps.WAITING_USERNAME)
+
+@dp.message(AddServerSteps.WAITING_USERNAME)
+async def process_server_username(message: Message, state: FSMContext):
+    """Обработка username"""
+    await state.update_data(username=message.text)
+    await message.answer("Введите password для панели 3x-ui:")
+    await state.set_state(AddServerSteps.WAITING_PASSWORD)
+
+@dp.message(AddServerSteps.WAITING_PASSWORD)
+async def process_server_password(message: Message, state: FSMContext):
+    """Обработка password"""
+    await state.update_data(password=message.text)
+    await message.answer("Введите Inbound ID (число):")
+    await state.set_state(AddServerSteps.WAITING_INBOUND_ID)
+
+@dp.message(AddServerSteps.WAITING_INBOUND_ID)
+async def process_server_inbound_id(message: Message, state: FSMContext):
+    """Обработка Inbound ID"""
+    try:
+        inbound_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Inbound ID должен быть числом. Попробуйте снова:")
+        return
+    
+    data = await state.get_data()
+    name = data.get('name')
+    ip = data.get('ip')
+    username = data.get('username')
+    password = data.get('password')
+    base_url = data.get('base_url')
+    
+    # Проверяем подключение к серверу
+    try:
+        test_client = XUIClient(
+            base_url=base_url,
+            username=username,
+            password=password,
+            inbound_id=inbound_id
+        )
+        test_client.login()
+        await message.answer(
+            f"✅ <b>Подключение к серверу успешно!</b>\n\n"
+            f"<b>Данные сервера:</b>\n"
+            f"Название: <i>{name}</i>\n"
+            f"IP: <i>{ip}</i>\n"
+            f"Base URL: <i>{base_url}</i>\n"
+            f"Username: <i>{username}</i>\n"
+            f"Inbound ID: <i>{inbound_id}</i>\n\n"
+            f"Сохранить этот сервер? (да/нет)"
+        )
+        await state.update_data(inbound_id=inbound_id)
+        await state.set_state(AddServerSteps.CONFIRMING)
+    except Exception as e:
+        await message.answer(
+            f"❌ <b>Ошибка подключения к серверу:</b>\n<code>{str(e)}</code>\n\n"
+            f"Проверьте данные и попробуйте снова. Используйте /add_server для повторного ввода."
+        )
+        await state.clear()
+
+@dp.message(AddServerSteps.CONFIRMING)
+async def process_server_confirmation(message: Message, state: FSMContext):
+    """Обработка подтверждения добавления сервера"""
+    if message.text.lower() not in ['да', 'yes', 'y', 'д']:
+        await message.answer("❌ Добавление сервера отменено.")
+        await state.clear()
+        return
+    
+    data = await state.get_data()
+    name = data.get('name')
+    ip = data.get('ip')
+    username = data.get('username')
+    password = data.get('password')
+    base_url = data.get('base_url')
+    inbound_id = data.get('inbound_id')
+    
+    # Сохраняем сервер в БД
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO servers (name, ip, username, password, inbound_id, base_url, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, TRUE)
+        ''', (name, ip, username, password, inbound_id, base_url))
+        conn.commit()
+        server_id = cursor.lastrowid
+    
+    await message.answer(
+        f"✅ <b>Сервер успешно добавлен!</b>\n\n"
+        f"ID: <i>{server_id}</i>\n"
+        f"Название: <i>{name}</i>\n"
+        f"IP: <i>{ip}</i>"
+    )
+    await state.clear()
+
+@dp.message(Command("servers"))
+async def cmd_list_servers(message: Message):
+    """Список всех серверов"""
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет доступа к этой команде.")
+        return
+    
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, name, ip, is_active 
+            FROM servers 
+            ORDER BY id
+        ''')
+        servers = cursor.fetchall()
+    
+    if not servers:
+        await message.answer("📭 Серверы не найдены. Используйте /add_server для добавления.")
+        return
+    
+    text = "🖥️ <b>Список серверов:</b>\n\n"
+    for server_id, name, ip, is_active in servers:
+        status = "✅ Активен" if is_active else "❌ Неактивен"
+        text += f"{server_id}. <b>{name}</b> ({ip})\n   {status}\n\n"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить сервер", callback_data="admin_add_server")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_refresh_servers")]
+    ])
+    
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.message(Command("toggle_server"))
+async def cmd_toggle_server(message: Message):
+    """Активация/деактивация сервера"""
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет доступа к этой команде.")
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Использование: /toggle_server <server_id>")
+        return
+    
+    try:
+        server_id = int(args[1])
+    except ValueError:
+        await message.answer("❌ Server ID должен быть числом.")
+        return
+    
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        # Получаем текущий статус
+        cursor.execute('SELECT is_active FROM servers WHERE id = ?', (server_id,))
+        result = cursor.fetchone()
+        
+        if not result:
+            await message.answer(f"❌ Сервер с ID {server_id} не найден.")
+            return
+        
+        current_status = result[0]
+        new_status = not current_status
+        
+        cursor.execute('''
+            UPDATE servers 
+            SET is_active = ?, updated_at = datetime('now')
+            WHERE id = ?
+        ''', (new_status, server_id))
+        conn.commit()
+        
+        status_text = "активирован" if new_status else "деактивирован"
+        await message.answer(f"✅ Сервер {server_id} {status_text}.")
+
+@dp.message(Command("delete_server"))
+async def cmd_delete_server(message: Message):
+    """Удаление сервера"""
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет доступа к этой команде.")
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Использование: /delete_server <server_id>")
+        return
+    
+    try:
+        server_id = int(args[1])
+    except ValueError:
+        await message.answer("❌ Server ID должен быть числом.")
+        return
+    
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        # Проверяем, используется ли сервер
+        cursor.execute('SELECT COUNT(*) FROM users WHERE server_id = ?', (server_id,))
+        users_count = cursor.fetchone()[0]
+        
+        if users_count > 0:
+            await message.answer(
+                f"❌ Нельзя удалить сервер, который используется {users_count} пользователями.\n"
+                f"Сначала деактивируйте сервер: /toggle_server {server_id}"
+            )
+            return
+        
+        cursor.execute('DELETE FROM servers WHERE id = ?', (server_id,))
+        conn.commit()
+        
+        if cursor.rowcount > 0:
+            await message.answer(f"✅ Сервер {server_id} удален.")
+        else:
+            await message.answer(f"❌ Сервер с ID {server_id} не найден.")
 
 async def daily_scheduler():
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
