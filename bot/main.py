@@ -267,18 +267,8 @@ async def handle_start(message: Message):
                 reply_markup=get_main_keyboard(user_id)
             )
 
-@dp.message(Command("prem"))
-@dp.callback_query(F.data == "open_premium")
-async def handle_sub_info(message_or_callback: Message | CallbackQuery, state: FSMContext):
-    if isinstance(message_or_callback, CallbackQuery):
-        message = message_or_callback.message
-        await message_or_callback.answer()
-        is_callback = True
-    else:
-        message = message_or_callback
-        is_callback = False
-    
-    user_id = message.from_user.id
+async def _get_subscription_info(user_id: int):
+    """Вспомогательная функция для получения информации о подписке"""
     with get_connection(cfg.database.db_path) as conn:
         cursor = conn.cursor()
         # Получаем данные пользователя - работаем с тем что есть
@@ -299,12 +289,9 @@ async def handle_sub_info(message_or_callback: Message | CallbackQuery, state: F
             result = cursor.fetchone()
         except Exception as e:
             # Если ошибка - используем дефолтные значения
-            logger.error(f"Database error in /prem: {e}")
+            logger.error(f"Database error in subscription info: {e}")
             result = None
-
-    builder = InlineKeyboardBuilder()
-    text = "💳 <b>Информация о вашем VPN:</b>\n\n"
-
+    
     # Обрабатываем данные пользователя
     if result:
         # Обрабатываем результат в зависимости от количества колонок
@@ -342,19 +329,44 @@ async def handle_sub_info(message_or_callback: Message | CallbackQuery, state: F
                     is_active = True
                     days_remaining = (end_date_only - today).days
                     end_date_str = end_date.strftime("%d.%m.%Y")
+                else:
+                    days_remaining = 0
+                    end_date_str = None
             except Exception as e:
                 logger.error(f"Error parsing subscription date: {e}, date: {subscription_end}")
                 is_active = False
+                days_remaining = 0
+                end_date_str = None
         else:
             is_active = False
+            days_remaining = 0
+            end_date_str = None
     else:
         # Пользователь не найден в базе - используем дефолтные значения
         subscription_end = None
         vless_link = None
         pay_subscribed = 0
         is_active = False
+        days_remaining = 0
+        end_date_str = None
     
-    # Теперь обрабатываем в зависимости от статуса подписки
+    return {
+        'is_active': is_active,
+        'subscription_end': subscription_end,
+        'vless_link': vless_link,
+        'pay_subscribed': pay_subscribed,
+        'days_remaining': days_remaining,
+        'end_date_str': end_date_str
+    }
+
+async def _build_subscription_message(info: dict, state: FSMContext):
+    """Строит сообщение и клавиатуру для подписки"""
+    builder = InlineKeyboardBuilder()
+    is_active = info['is_active']
+    days_remaining = info['days_remaining']
+    end_date_str = info['end_date_str']
+    vless_link = info['vless_link']
+    
     if is_active:
         # Если подписка активна - показываем информацию и VPN ссылку
         text = (
@@ -402,34 +414,15 @@ async def handle_sub_info(message_or_callback: Message | CallbackQuery, state: F
                     callback_data=f"plan:{plan_id}"
                 )
             builder.adjust(1)
+            await state.set_state(SubscriptionSteps.CHOOSING_PLAN)
         else:
             text += "💡 Ваша подписка активна. Вы сможете продлить её за 3 дня до окончания.\n\n"
+            await state.clear()
         
         # Кнопка "Назад" всегда
         builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
-        
-        # Если это callback - редактируем сообщение, иначе отправляем новое
-        if is_callback:
-            await message.edit_text(
-                text,
-                reply_markup=builder.as_markup(),
-                parse_mode="HTML"
-            )
-        else:
-            await message.answer(
-                text,
-                reply_markup=builder.as_markup(),
-                parse_mode="HTML"
-            )
-        
-        # Устанавливаем состояние только если есть кнопки продления
-        if days_remaining <= 3:
-            await state.set_state(SubscriptionSteps.CHOOSING_PLAN)
-        else:
-            await state.clear()
     else:
         # Если подписка неактивна или пользователя нет - показываем планы
-        # Подписка неактивна - показываем планы для покупки
         text = "💳 <b>Информация о вашем VPN:</b>\n\n"
         text += (
             "❌ Ваш VPN <b>неактивен</b>!\n\n"
@@ -446,20 +439,42 @@ async def handle_sub_info(message_or_callback: Message | CallbackQuery, state: F
             )
         builder.adjust(1)
         builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
-
-        if is_callback:
-            await message.edit_text(
-                text,
-                reply_markup=builder.as_markup(),
-                parse_mode="HTML"
-            )
-        else:
-            await message.answer(
-                text,
-                reply_markup=builder.as_markup(),
-                parse_mode="HTML"
-            )
         await state.set_state(SubscriptionSteps.CHOOSING_PLAN)
+    
+    return text, builder
+
+@dp.callback_query(F.data == "open_premium")
+async def handle_open_premium_callback(callback: CallbackQuery, state: FSMContext):
+    """Обработчик кнопки Premium (callback)"""
+    user_id = callback.from_user.id
+    await callback.answer()
+    
+    info = await _get_subscription_info(user_id)
+    text, builder = await _build_subscription_message(info, state)
+    
+    await callback.message.edit_text(
+        text,
+        reply_markup=builder.as_markup(),
+        parse_mode="HTML"
+    )
+
+@dp.message(Command("prem"))
+async def handle_prem_command(message: Message, state: FSMContext):
+    """Обработчик команды /prem"""
+    user_id = message.from_user.id
+    
+    info = await _get_subscription_info(user_id)
+    text, builder = await _build_subscription_message(info, state)
+    
+    await message.answer(
+        text,
+        reply_markup=builder.as_markup(),
+        parse_mode="HTML"
+    )
+
+async def handle_sub_info(callback: CallbackQuery, state: FSMContext):
+    """Обертка для обратной совместимости - вызывает callback обработчик"""
+    await handle_open_premium_callback(callback, state)
 
 @dp.callback_query(SubscriptionSteps.CHOOSING_PLAN, F.data.startswith("plan:"))
 async def select_plan(callback: CallbackQuery, state: FSMContext):
@@ -491,14 +506,14 @@ async def select_plan(callback: CallbackQuery, state: FSMContext):
     if not is_renewal and active_sub:
         await callback.answer("❌ У вас уже есть активная подписка! Используйте продление.", show_alert=True)
         # Возвращаем к меню подписки
-        await handle_sub_info(callback, state)
+        await handle_open_premium_callback(callback, state)
         return
     
     # Если пользователь пытается продлить, но подписка еще не заканчивается (осталось > 3 дня)
     if is_renewal:
         if not active_sub:
             await callback.answer("❌ У вас нет активной подписки для продления!", show_alert=True)
-            await handle_sub_info(callback, state)
+            await handle_open_premium_callback(callback, state)
             return
 
         cursor.execute('''
@@ -511,7 +526,7 @@ async def select_plan(callback: CallbackQuery, state: FSMContext):
         days_result = cursor.fetchone()
         if days_result and days_result[0] and int(days_result[0]) > 3:
             await callback.answer("❌ Продление доступно только за 3 дня до окончания подписки!", show_alert=True)
-            await handle_sub_info(callback, state)
+            await handle_open_premium_callback(callback, state)
             return
 
     await state.update_data(
