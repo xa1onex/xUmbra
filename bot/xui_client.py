@@ -417,5 +417,116 @@ class XUIClient:
         # Если все методы не сработали, просто логируем ошибку, но не падаем
         # (ключ все равно удалится из БД)
         print(f"[xui] WARNING: Could not delete client {client_id} from server, but will continue with DB deletion")
+    
+    def update_client_expiry(self, client_id: str, expiry_time_unix_ms: int) -> None:
+        """Обновляет expiryTime существующего клиента в inbound на панели x-ui/3x-ui"""
+        self.ensure_login()
+        
+        inbound_id = self.inbound_id
+        if not inbound_id:
+            raise RuntimeError("inbound_id is not set")
+        
+        # Получаем текущий inbound
+        inbs = self._client.get("panel/api/inbounds/list").json().get("obj", [])
+        chosen = None
+        for i in inbs:
+            if i.get('id') == inbound_id:
+                chosen = i
+                break
+        
+        if not chosen:
+            raise RuntimeError(f'Не найден inbound с ID {inbound_id}')
+        
+        # Получаем текущие настройки клиентов
+        settings_str = chosen.get('settings', '{}')
+        try:
+            if isinstance(settings_str, str):
+                settings = json.loads(settings_str)
+            else:
+                settings = settings_str
+        except:
+            settings = {}
+        
+        clients = settings.get('clients', [])
+        if not isinstance(clients, list):
+            clients = []
+        
+        # Находим клиента и обновляем его expiryTime
+        client_found = False
+        for client in clients:
+            if client.get('id') == client_id:
+                client['expiryTime'] = expiry_time_unix_ms
+                client_found = True
+                break
+        
+        if not client_found:
+            raise RuntimeError(f'Клиент с ID {client_id} не найден в списке клиентов')
+        
+        # Обновляем settings с обновленным списком клиентов
+        settings['clients'] = clients
+        updated_settings = json.dumps(settings)
+        
+        # Формируем payload для обновления inbound
+        required_fields = ['id', 'settings', 'streamSettings', 'sniffing', 'protocol', 
+                          'port', 'listen', 'remark', 'enable', 'expiryTime', 
+                          'trafficReset', 'lastTrafficResetTime', 'tag']
+        payload = {}
+        for key in required_fields:
+            if key in chosen:
+                if key == 'settings':
+                    payload[key] = updated_settings
+                else:
+                    payload[key] = chosen[key]
+        
+        headers = {"Content-Type": "application/json", **self._auth_headers()}
+        
+        # Пробуем endpoint update с ID в пути через POST (работает на этой панели)
+        try:
+            endpoint = f"panel/api/inbounds/update/{inbound_id}"
+            print(f"[xui] POST {self.base_url}{endpoint} payload: updating client {client_id} expiry to {expiry_time_unix_ms}")
+            resp = self._client.post(endpoint, json=payload, headers=headers)
+            print(f"[xui] Status={resp.status_code} Response={resp.text}")
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success", True):
+                    print(f"[xui] Successfully updated client {client_id} expiry using update/{inbound_id}")
+                    return
+        except Exception as e:
+            print(f"[xui] update/{inbound_id} failed: {e}")
+        
+        # Пробуем endpoint updateAll (обычно работает в 3x-ui)
+        try:
+            payload_all = [payload]
+            endpoint = "panel/api/inbounds/updateAll"
+            print(f"[xui] POST {self.base_url}{endpoint} payload: {payload_all}")
+            resp = self._client.post(endpoint, json=payload_all, headers=headers)
+            print(f"[xui] Status={resp.status_code} Response={resp.text}")
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success", True):
+                    print(f"[xui] Successfully updated client {client_id} expiry using updateAll")
+                    return
+        except Exception as e:
+            print(f"[xui] updateAll failed: {e}")
+        
+        # Пробуем endpoint update без ID в пути
+        try:
+            endpoint = "panel/api/inbounds/update"
+            print(f"[xui] POST {self.base_url}{endpoint} payload: {payload}")
+            resp = self._client.post(endpoint, json=payload, headers=headers)
+            print(f"[xui] Status={resp.status_code} Response={resp.text}")
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success", True):
+                    print(f"[xui] Successfully updated client {client_id} expiry using update")
+                    return
+        except Exception as e:
+            print(f"[xui] update failed: {e}")
+        
+        # Если все методы не сработали, выбрасываем исключение
+        raise RuntimeError(f"Could not update client {client_id} expiry on server")
 
 

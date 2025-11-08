@@ -1961,6 +1961,120 @@ async def cmd_delete_server(message: Message):
         else:
             await message.answer(f"❌ Сервер с ID {server_id} не найден.")
 
+async def sync_subscriptions_and_keys(db_path: str):
+    """Синхронизирует подписки и ключи: продлевает ключи до даты окончания подписки"""
+    logger.info("Starting subscription and keys synchronization...")
+    
+    try:
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Получаем всех пользователей с активными подписками
+            cursor.execute('''
+                SELECT user_id, subscription_end, pay_subscribed
+                FROM users
+                WHERE pay_subscribed = 1 
+                  AND subscription_end IS NOT NULL
+                  AND subscription_end >= DATE('now')
+            ''')
+            users = cursor.fetchall()
+            
+            updated_count = 0
+            error_count = 0
+            
+            for user_id, subscription_end, pay_subscribed in users:
+                try:
+                    # Парсим дату окончания подписки
+                    if isinstance(subscription_end, str):
+                        if ' ' in subscription_end:
+                            sub_end_date = datetime.strptime(subscription_end.split()[0], "%Y-%m-%d")
+                        else:
+                            sub_end_date = datetime.strptime(subscription_end, "%Y-%m-%d")
+                    else:
+                        sub_end_date = subscription_end
+                    
+                    # Вычисляем expiry_time в миллисекундах (конец дня)
+                    from datetime import time as dt_time
+                    sub_end_datetime = datetime.combine(sub_end_date.date(), dt_time(23, 59, 59))
+                    subscription_expiry_ms = int(sub_end_datetime.timestamp() * 1000)
+                    
+                    # Получаем все активные ключи пользователя
+                    cursor.execute('''
+                        SELECT k.id, k.server_id, k.vless_client_id, k.expires_at, s.name, s.base_url, 
+                               s.username, s.password, s.inbound_id
+                        FROM vpn_keys k
+                        LEFT JOIN servers s ON k.server_id = s.id
+                        WHERE k.user_id = ? AND k.is_active = TRUE
+                    ''', (user_id,))
+                    keys = cursor.fetchall()
+                    
+                    for key_data in keys:
+                        key_id, server_id, vless_client_id, key_expires_at, server_name, \
+                        server_base_url, server_username, server_password, server_inbound_id = key_data
+                        
+                        if not server_id or not vless_client_id:
+                            continue
+                        
+                        # Парсим дату истечения ключа
+                        try:
+                            if isinstance(key_expires_at, str):
+                                if ' ' in key_expires_at:
+                                    key_end_date = datetime.strptime(key_expires_at.split()[0], "%Y-%m-%d")
+                                else:
+                                    key_end_date = datetime.strptime(key_expires_at, "%Y-%m-%d")
+                            else:
+                                key_end_date = key_expires_at
+                            
+                            # Вычисляем expiry_time ключа в миллисекундах
+                            key_end_datetime = datetime.combine(key_end_date.date(), dt_time(23, 59, 59))
+                            key_expiry_ms = int(key_end_datetime.timestamp() * 1000)
+                            
+                            # Если подписка продлена (дата окончания подписки > дата истечения ключа)
+                            if subscription_expiry_ms > key_expiry_ms:
+                                # Обновляем ключ в панели x-ui
+                                try:
+                                    server_client = XUIClient(
+                                        base_url=server_base_url,
+                                        username=server_username,
+                                        password=server_password,
+                                        inbound_id=server_inbound_id
+                                    )
+                                    
+                                    server_client.update_client_expiry(
+                                        client_id=vless_client_id,
+                                        expiry_time_unix_ms=subscription_expiry_ms
+                                    )
+                                    
+                                    # Обновляем дату истечения ключа в БД
+                                    new_expires_at = sub_end_date.strftime("%Y-%m-%d")
+                                    cursor.execute('''
+                                        UPDATE vpn_keys
+                                        SET expires_at = ?
+                                        WHERE id = ?
+                                    ''', (new_expires_at, key_id))
+                                    conn.commit()
+                                    
+                                    updated_count += 1
+                                    logger.info(f"Updated key {key_id} (client {vless_client_id}) for user {user_id} "
+                                              f"from {key_expires_at} to {subscription_end}")
+                                    
+                                except Exception as e:
+                                    error_count += 1
+                                    logger.error(f"Failed to update key {key_id} for user {user_id}: {e}")
+                            
+                        except Exception as e:
+                            logger.error(f"Error parsing key expiry date for key {key_id}: {e}")
+                            error_count += 1
+                
+                except Exception as e:
+                    logger.error(f"Error processing user {user_id}: {e}")
+                    error_count += 1
+            
+            logger.info(f"Subscription and keys sync completed: {updated_count} keys updated, {error_count} errors")
+    
+    except Exception as e:
+        logger.error(f"Error in sync_subscriptions_and_keys: {e}")
+
 async def daily_scheduler():
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(
@@ -1968,6 +2082,14 @@ async def daily_scheduler():
         'cron',
         hour=12,
         minute=0,
+        args=[cfg.database.db_path]
+    )
+    # Синхронизация подписок и ключей раз в день в 12:05
+    scheduler.add_job(
+        sync_subscriptions_and_keys,
+        'cron',
+        hour=12,
+        minute=5,
         args=[cfg.database.db_path]
     )
     scheduler.start()
