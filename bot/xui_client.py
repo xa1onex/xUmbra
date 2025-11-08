@@ -276,27 +276,68 @@ class XUIClient:
         if not inbound_id:
             raise RuntimeError("inbound_id is not set")
         
-        # Формируем payload для удаления клиента
-        client_dict = {
-            "id": client_id
-        }
+        # Получаем текущий inbound
+        inbs = self._client.get("panel/api/inbounds/list").json().get("obj", [])
+        chosen = None
+        for i in inbs:
+            if i.get('id') == inbound_id:
+                chosen = i
+                break
+        
+        if not chosen:
+            raise RuntimeError(f'Не найден inbound с ID {inbound_id}')
+        
+        # Получаем текущие настройки клиентов
+        settings_str = chosen.get('settings', '{}')
+        try:
+            if isinstance(settings_str, str):
+                settings = json.loads(settings_str)
+            else:
+                settings = settings_str
+        except:
+            settings = {}
+        
+        clients = settings.get('clients', [])
+        if not isinstance(clients, list):
+            clients = []
+        
+        # Удаляем клиента из списка
+        original_count = len(clients)
+        clients = [c for c in clients if c.get('id') != client_id]
+        
+        if len(clients) == original_count:
+            # Клиент не найден в списке - возможно уже удален
+            print(f"[xui] Client {client_id} not found in clients list, may already be deleted")
+            return
+        
+        # Обновляем settings с новым списком клиентов
+        settings['clients'] = clients
+        updated_settings = json.dumps(settings)
+        
+        # Формируем payload для обновления inbound
         payload = {
             "id": inbound_id,
-            "settings": json.dumps({"clients": [client_dict]})
+            "settings": updated_settings
         }
+        
+        # Копируем все остальные поля из текущего inbound
+        for key in ['remark', 'listen', 'port', 'protocol', 'streamSettings', 'sniffing', 'tag']:
+            if key in chosen:
+                payload[key] = chosen[key]
+        
         headers = {"Content-Type": "application/json", **self._auth_headers()}
         
-        # Используем endpoint для удаления клиента
-        endpoint = "panel/api/inbounds/delClient"
+        # Обновляем inbound
+        endpoint = "panel/api/inbounds/update"
         print(f"[xui] POST {self.base_url}{endpoint} payload: {payload}")
         resp = self._client.post(endpoint, json=payload, headers=headers)
         print(f"[xui] Status={resp.status_code} Response={resp.text}")
         
         if resp.status_code != 200:
-            raise RuntimeError(f"delClient failed: {resp.status_code} {resp.text}")
+            raise RuntimeError(f"update inbound failed: {resp.status_code} {resp.text}")
         
         data = resp.json()
         if not data.get("success", True):
-            raise RuntimeError(f"delClient error: {data}")
+            raise RuntimeError(f"update inbound error: {data}")
 
 
