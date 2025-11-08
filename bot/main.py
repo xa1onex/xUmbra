@@ -214,7 +214,7 @@ def get_main_text(first_name: str, subscription_status: str, user_id: int = None
         "<i>/start</i> - Перезагрузить бота\n"
         "<i>/prem</i> - Покупка VPN\n"
         "<i>/invite</i> - Пригласи друга\n\n"
-        f"<code>{ann}\nb1.1.12</code>"
+        f"<code>{ann}\nb1.1.19</code>"
     )
     return msg
 
@@ -1419,7 +1419,7 @@ async def handle_key_server_selection(callback: CallbackQuery, state: FSMContext
                         # Продолжаем работу даже если не удалось удалить старый клиент
         
         builder = InlineKeyboardBuilder()
-        builder.row(InlineKeyboardButton(text="◀️ Назад к ключам", callback_data="manage_keys"))
+        builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
         
         await callback.message.edit_text(
             f"✅ <b>Ключ успешно {'заменен' if key_to_replace else 'создан'}!</b>\n\n"
