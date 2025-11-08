@@ -166,7 +166,7 @@ def get_main_text(first_name: str, subscription_status: str) -> str:
         "<i>/prem</i> - Покупка VPN\n"
         "<i>/invite</i> - Пригласи друга\n\n"
         "<code>!!!ВНИМАНИЕ!!! Это бета-тест, VPN работает нестабильно, платежи также находятся в тестировании - они не реальны!!!\n"
-        "b1.1.7</code>"
+        "b1.1.8</code>"
     )
 
 @dp.message(CommandStart())
@@ -280,29 +280,10 @@ async def handle_start(message: Message):
             cursor.execute("UPDATE users SET last_activity = datetime('now') WHERE user_id = ?", (user_id,))
             conn.commit()
 
-            # Проверяем статус подписки
-            cursor.execute('''
-                SELECT subscription_end, pay_subscribed 
-                FROM users 
-                WHERE user_id = ?
-            ''', (user_id,))
-            user_data = cursor.fetchone()
-            
-            subscription_status = "неактивен"
-            if user_data and user_data[1] == 1 and user_data[0]:
-                end_date = datetime.strptime(user_data[0], "%Y-%m-%d")
-                if end_date >= datetime.now():
-                    subscription_status = f"активен до {end_date.strftime('%d.%m.%Y')}"
-
+            subscription_status = get_subscription_status(user_id)
             await message.answer(
-                f"👋 Рады видеть тебя снова, <b>{first_name}</b>!\n\n"
-                f"<b>VPN</b>: <i>{subscription_status}</i>\n\n"
-                f"📌 <b>Команды:</b>\n"
-                "<i>/start</i> - Перезагрузить бота\n"
-                "<i>/prem</i> - Покупка VPN\n"
-                "<i>/invite</i> - Пригласи друга\n\n"
-                "<code>!!!ВНИМАНИЕ!!! Это бета-тест, VPN работает не стабильно, платежи также находятся в тестировании - они не реальны!!!</code>",
-                parse_mode='HTML', 
+                get_main_text(first_name, subscription_status),
+                parse_mode="HTML",
                 reply_markup=get_main_keyboard(user_id)
             )
 
