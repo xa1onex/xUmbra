@@ -271,7 +271,7 @@ async def handle_start(message: Message):
                 "<i>/start</i> - Перезагрузить бота\n"
                 "<i>/prem</i> - Покупка VPN\n"
                 "<i>/invite</i> - Пригласи друга\n\n"
-                "Используйте кнопки ниже для управления.",
+                "<code>!!!ВНИМАНИЕ!!! Это бета-тест, VPN работает не стабильно, платежи также находятся в тестировании - они не реальны!!!</code>",
                 parse_mode='HTML', 
                 reply_markup=get_main_keyboard(user_id)
             )
@@ -991,7 +991,7 @@ async def go_back_handler(callback: CallbackQuery):
         "<i>/start</i> - Перезагрузить бота\n"
         "<i>/prem</i> - Покупка VPN\n"
         "<i>/invite</i> - Пригласи друга\n\n"
-        "Используйте кнопки ниже для управления.",
+        "<code>!!!ВНИМАНИЕ!!! Это бета-тест, VPN работает не стабильно, платежи также находятся в тестировании - они не реальны!!!</code>",
         parse_mode='HTML', 
         reply_markup=get_main_keyboard(user_id)
     )
