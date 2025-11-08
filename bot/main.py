@@ -1638,7 +1638,7 @@ async def handle_replace_key(callback: CallbackQuery, state: FSMContext):
     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data=f"view_key:{key_id}"))
     
     await callback.message.edit_text(
-        "🔄 <b>Замена ключа</b></b>\n\n"
+        "🔄 <b>Замена ключа</b>\n\n"
         "Выберите сервер для нового ключа:",
         parse_mode="HTML",
         reply_markup=builder.as_markup()
