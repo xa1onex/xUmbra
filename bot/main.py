@@ -124,23 +124,27 @@ class AddServerSteps(StatesGroup):
 class AdminEditStates(StatesGroup):
     EDIT_ANNOUNCEMENT = State()
 
-ANNOUNCEMENT_FILE = "announcement.txt"
-
 def get_announcement_text() -> str:
-    """Получает текст объявления из файла, если есть, иначе возвращает дефолтный текст"""
-    try:
-        with open(ANNOUNCEMENT_FILE, "r", encoding="utf-8") as f:
-            ann = f.read().strip()
-            if ann:
-                return
-    except Exception:
-        pass
-    return "!!!ВНИМАНИЕ!!! то бета-тест, VPN работает нестабильно, платежи также находятся в тестировании - они не реальны!!!\n"  # дефолт
+    """Получает текст объявления из БД"""
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT text FROM announcements ORDER BY id DESC LIMIT 1')
+        result = cursor.fetchone()
+        if result:
+            return result[0]
+    # Дефолтный текст, если в БД ничего нет
+    return "!!!ВНИМАНИЕ!!! Это бета-тест, VPN работает нестабильно, платежи также находятся в тестировании - они не реальны!!!\n"
 
 def set_announcement_text(new_text: str):
-    """Сохраняет текст объявления в файл"""
-    with open(ANNOUNCEMENT_FILE, "w", encoding="utf-8") as f:
-        f.write(new_text.strip())
+    """Сохраняет текст объявления в БД"""
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        # Удаляем старые объявления и добавляем новое
+        cursor.execute('DELETE FROM announcements')
+        cursor.execute('''
+            INSERT INTO announcements (text, updated_at) VALUES (?, CURRENT_TIMESTAMP)
+        ''', (new_text.strip(),))
+        conn.commit()
 
 cfg = load_config()
 bot = Bot(token=cfg.bot.bot_token)

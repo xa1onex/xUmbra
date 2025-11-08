@@ -170,30 +170,91 @@ class XUIClient:
         stream_settings = json.loads(chosen.get('streamSettings', '{}'))
         reality_settings = stream_settings.get('realitySettings') or {}
         
-        # Извлекаем параметры REALITY
+        # Извлекаем параметры REALITY из настроек панели
         pbk = ''
         sid = ''
         sni = 'google.com'
+        fp = 'chrome'  # дефолтное значение
+        
         if reality_settings:
-            pbk = reality_settings.get('settings', {}).get('publicKey', '')
+            # Получаем settings - может быть объектом или строкой JSON
+            settings = reality_settings.get('settings', {})
+            if isinstance(settings, str):
+                try:
+                    settings = json.loads(settings)
+                except:
+                    settings = {}
+            elif not isinstance(settings, dict):
+                settings = {}
+            
+            # Получаем publicKey из settings
+            pbk = settings.get('publicKey', '')
+            
+            # Получаем shortId (sid) - может быть в realitySettings.shortId, shortIds или settings.shortId
             sid = reality_settings.get('shortId', '')
-            sni = reality_settings.get('serverNames', [])
-            if isinstance(sni, list) and len(sni) > 0:
-                sni = sni[0]
-            elif not sni or sni == []:
+            if not sid:
+                # Пробуем получить из shortIds (массив)
+                short_ids = reality_settings.get('shortIds', [])
+                if isinstance(short_ids, list) and len(short_ids) > 0:
+                    sid = short_ids[0]
+                elif isinstance(short_ids, str):
+                    sid = short_ids
+                # Пробуем получить из settings
+                if not sid:
+                    sid = settings.get('shortId', '')
+                    if not sid:
+                        short_ids = settings.get('shortIds', [])
+                        if isinstance(short_ids, list) and len(short_ids) > 0:
+                            sid = short_ids[0]
+                        elif isinstance(short_ids, str):
+                            sid = short_ids
+            
+            # Получаем serverNames (sni) - может быть массивом или строкой
+            sni_list = reality_settings.get('serverNames', [])
+            if isinstance(sni_list, str):
+                try:
+                    sni_list = json.loads(sni_list)
+                except:
+                    sni_list = [sni_list] if sni_list else []
+            if isinstance(sni_list, list) and len(sni_list) > 0:
+                sni = sni_list[0]
+            elif isinstance(sni_list, str) and sni_list:
+                sni = sni_list
+            elif not sni_list or sni_list == []:
                 sni = 'google.com'
+            
+            # Получаем fingerprints (fp) - может быть в settings.fingerprints или realitySettings.fingerprints
+            fingerprints = settings.get('fingerprints', [])
+            if not fingerprints:
+                fingerprints = reality_settings.get('fingerprints', [])
+            
+            if isinstance(fingerprints, str):
+                try:
+                    fingerprints = json.loads(fingerprints)
+                except:
+                    fingerprints = [fingerprints] if fingerprints else []
+            
+            if isinstance(fingerprints, list) and len(fingerprints) > 0:
+                fp = fingerprints[0]
+            elif isinstance(fingerprints, str) and fingerprints:
+                fp = fingerprints
+            else:
+                fp = 'chrome'  # дефолт если не найдено
         
         # Получаем IP сервера из настроек inbound или из base_url
         server_ip = chosen.get('listen') or ''
         if not server_ip or server_ip == '0.0.0.0' or server_ip == '':
-            # Берем IP из base_url
-            server_ip = self.base_url.split('//')[-1].split(':')[0]
+            # Берем IP/домен из base_url
+            # Убираем протокол и путь
+            url_part = self.base_url.split('//')[-1].split('/')[0]
+            # Извлекаем хост (без порта)
+            server_ip = url_part.split(':')[0]
         
         # Формируем ссылку vless в правильном порядке параметров
         link = f"vless://{client_uuid}@{server_ip}:{port}/?type=tcp&encryption=none&security=reality"
         if pbk:
             link += f"&pbk={pbk}"
-        link += "&fp=chrome"
+        link += f"&fp={fp}"
         link += f"&sni={sni}"
         link += f"&sid={sid if sid else '3d'}"
         link += "&spx=%2F&flow=xtls-rprx-vision"
