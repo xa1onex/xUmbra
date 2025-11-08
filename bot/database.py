@@ -121,6 +121,60 @@ def init_db(db_path: str = DATABASE_FILE):
             except Exception as e:
                 logging.warning(f"Could not add port column: {e}")
 
+        # Таблица для объявлений
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS announcements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Проверяем и добавляем колонку updated_at, если её нет
+        cursor.execute("PRAGMA table_info(announcements)")
+        announcement_columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'updated_at' not in announcement_columns:
+            try:
+                cursor.execute('ALTER TABLE announcements ADD COLUMN updated_at TEXT DEFAULT CURRENT_TIMESTAMP')
+                logging.info("Added updated_at column to announcements table")
+                # Обновляем список колонок после добавления
+                announcement_columns.append('updated_at')
+            except Exception as e:
+                logging.warning(f"Could not add updated_at column: {e}")
+        
+        # Если таблица пустая, добавляем дефолтное объявление
+        cursor.execute('SELECT COUNT(*) FROM announcements')
+        if cursor.fetchone()[0] == 0:
+            default_text = "!!!ВНИМАНИЕ!!! Это бета-тест, VPN работает нестабильно, платежи также находятся в тестировании - они не реальны!!!\n"
+            # Проверяем наличие колонки updated_at перед вставкой
+            if 'updated_at' in announcement_columns:
+                cursor.execute('''
+                    INSERT INTO announcements (text, updated_at) VALUES (?, CURRENT_TIMESTAMP)
+                ''', (default_text,))
+            else:
+                cursor.execute('''
+                    INSERT INTO announcements (text) VALUES (?)
+                ''', (default_text,))
+
+        # Таблица для VPN ключей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS vpn_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                server_id INTEGER NOT NULL,
+                vless_client_id TEXT NOT NULL,
+                vless_link TEXT NOT NULL,
+                key_name TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                expires_at TEXT,
+                traffic_gb INTEGER,
+                is_active BOOLEAN DEFAULT TRUE,
+                FOREIGN KEY(user_id) REFERENCES users(user_id),
+                FOREIGN KEY(server_id) REFERENCES servers(id)
+            )
+        ''')
+
         conn.commit()
 
 def get_connection(db_path: str = DATABASE_FILE):

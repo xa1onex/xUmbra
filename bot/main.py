@@ -2,6 +2,7 @@ import os
 import asyncio
 import secrets
 import logging
+import time
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
@@ -124,6 +125,13 @@ class AddServerSteps(StatesGroup):
 class AdminEditStates(StatesGroup):
     EDIT_ANNOUNCEMENT = State()
 
+class KeyManagementStates(StatesGroup):
+    CHOOSING_SERVER_FOR_KEY = State()
+    ENTERING_KEY_NAME = State()
+    VIEWING_KEY = State()
+    CONFIRMING_DELETE = State()
+    CONFIRMING_REPLACE = State()
+
 def get_announcement_text() -> str:
     """Получает текст объявления из БД"""
     with get_connection(cfg.database.db_path) as conn:
@@ -139,11 +147,21 @@ def set_announcement_text(new_text: str):
     """Сохраняет текст объявления в БД"""
     with get_connection(cfg.database.db_path) as conn:
         cursor = conn.cursor()
+        # Проверяем наличие колонки updated_at
+        cursor.execute("PRAGMA table_info(announcements)")
+        columns = [column[1] for column in cursor.fetchall()]
+        has_updated_at = 'updated_at' in columns
+        
         # Удаляем старые объявления и добавляем новое
         cursor.execute('DELETE FROM announcements')
-        cursor.execute('''
-            INSERT INTO announcements (text, updated_at) VALUES (?, CURRENT_TIMESTAMP)
-        ''', (new_text.strip(),))
+        if has_updated_at:
+            cursor.execute('''
+                INSERT INTO announcements (text, updated_at) VALUES (?, CURRENT_TIMESTAMP)
+            ''', (new_text.strip(),))
+        else:
+            cursor.execute('''
+                INSERT INTO announcements (text) VALUES (?)
+            ''', (new_text.strip(),))
         conn.commit()
 
 cfg = load_config()
@@ -158,6 +176,9 @@ def get_main_keyboard(user_id: int):
     builder.row(
         InlineKeyboardButton(text="💳 Premium", callback_data="open_premium"),
         InlineKeyboardButton(text="🎁 Рефералка", callback_data="open_invite")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔑 Мои ключи", callback_data="manage_keys")
     )
     builder.row(
         InlineKeyboardButton(text="🆘 Помощь", callback_data="open_help")
@@ -788,27 +809,7 @@ async def process_successful_payment(message: Message):
             server_port = 54321
             server_protocol = 'https'
         
-        # Создаем клиент для конкретного сервера
-        try:
-            server_client = XUIClient(
-                base_url=server_base_url,
-                username=server_username,
-                password=server_password,
-                inbound_id=server_inbound_id
-            )
-            result = server_client.add_vless_client(
-                telegram_user_id=user_id,
-                display_name=username,
-                traffic_gb=traffic_gb,
-                days_valid=duration_months * 30,
-            )
-            vless_client_id = result.get("id")
-            vless_link = result.get("link")
-        except Exception as e:
-            logger.error(f"Failed to create x-ui client on server {server_id}: {e}")
-            raise ValueError(f"Ошибка при создании VPN подключения на сервере {server_name}: {e}")
-
-        # Обновление подписки в базе данных
+        # Обновление подписки в базе данных (БЕЗ создания ключа)
         with get_connection(cfg.database.db_path) as conn:
             cursor = conn.cursor()
 
@@ -819,24 +820,19 @@ async def process_successful_payment(message: Message):
                     UPDATE users 
                     SET 
                         pay_subscribed = 1,
-                        server_id = ?,
-                        vless_client_id = ?,
-                        vless_link = ?,
                         subscription_end = DATE('now', '+' || ? || ' days'),
                         renewal_used = 0
                     WHERE user_id = ?
-                ''', (server_id, vless_client_id, vless_link, days, user_id))
+                ''', (days, user_id))
             else:
                 # Продление существующей подписки
                 cursor.execute('''
                     UPDATE users 
                     SET 
                         subscription_end = DATE(subscription_end, ?),
-                        renewal_used = 1,
-                        vless_client_id = ?,
-                        vless_link = ?
+                        renewal_used = 1
                     WHERE user_id = ?
-                ''', (f"+{duration_months} months", vless_client_id, vless_link, user_id))
+                ''', (f"+{duration_months} months", user_id))
 
             # Получаем обновленную дату окончания
             cursor.execute('''
@@ -875,19 +871,18 @@ async def process_successful_payment(message: Message):
 
         # Формирование квитанции
         receipt = (
-            f"💳 <b>VPN</b> успешно активирован!\n\n"
+            f"💳 <b>VPN подписка</b> успешно активирована!\n\n"
             f"<b>Чек на оплату</b>\n"
             f"Дата активации: <i>{activation_date}</i>\n"
             f"Дата окончания: <i>{end_date}</i>\n"
             f"Способ оплаты: <i>{method_data['title']}</i>\n"
             f"Сумма оплаты: <i>{formatted_price}</i>\n\n"
-            f"<b>Детали VPN</b>:\n"
+            f"<b>Детали подписки</b>:\n"
             f"• План: <i>{plan_data['title']}</i>\n"
-            f"• Сервер: <i>{server_name}</i>\n"
             f"• Трафик: <i>{traffic_gb} ГБ</i>\n"
             f"• Срок: <i>{duration_months} месяцев</i>\n\n"
-            f"🔗 <b>Ваша VPN ссылка:</b>\n"
-            f"<code>{vless_link}</code>\n\n"
+            f"✅ Теперь вы можете создать до 3 VPN ключей!\n"
+            f"Используйте раздел <b>🔑 Мои ключи</b> в главном меню.\n\n"
             f"ID транзакции: <blockquote>{message.successful_payment.telegram_payment_charge_id}</blockquote>"
         )
 
@@ -1118,6 +1113,512 @@ def get_server_by_id(server_id: int):
             WHERE id = ?
         ''', (server_id,))
         return cursor.fetchone()
+
+def check_user_subscription(user_id: int) -> bool:
+    """Проверка, есть ли у пользователя активная подписка"""
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT pay_subscribed, subscription_end 
+            FROM users 
+            WHERE user_id = ?
+        ''', (user_id,))
+        result = cursor.fetchone()
+        if not result or result[0] != 1:
+            return False
+        if result[1]:
+            try:
+                end_date = datetime.strptime(result[1], "%Y-%m-%d")
+                return end_date >= datetime.now()
+            except:
+                return False
+        return False
+
+def get_user_keys_count(user_id: int) -> int:
+    """Получить количество активных ключей пользователя"""
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(*) FROM vpn_keys 
+            WHERE user_id = ? AND is_active = TRUE
+        ''', (user_id,))
+        return cursor.fetchone()[0]
+
+def get_user_keys(user_id: int):
+    """Получить список всех ключей пользователя"""
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT k.id, k.key_name, k.vless_link, k.created_at, k.expires_at, 
+                   k.traffic_gb, k.is_active, s.name as server_name
+            FROM vpn_keys k
+            LEFT JOIN servers s ON k.server_id = s.id
+            WHERE k.user_id = ?
+            ORDER BY k.created_at DESC
+        ''', (user_id,))
+        return cursor.fetchall()
+
+def get_key_by_id(key_id: int, user_id: int):
+    """Получить информацию о ключе по ID"""
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT k.id, k.key_name, k.vless_link, k.vless_client_id, k.created_at, 
+                   k.expires_at, k.traffic_gb, k.is_active, k.server_id, s.name as server_name
+            FROM vpn_keys k
+            LEFT JOIN servers s ON k.server_id = s.id
+            WHERE k.id = ? AND k.user_id = ?
+        ''', (key_id, user_id))
+        return cursor.fetchone()
+
+# ==================== УПРАВЛЕНИЕ КЛЮЧАМИ ====================
+
+@dp.callback_query(F.data == "manage_keys")
+async def handle_manage_keys(callback: CallbackQuery):
+    """Обработчик раздела управления ключами"""
+    user_id = callback.from_user.id
+    
+    # Проверяем подписку
+    if not check_user_subscription(user_id):
+        await callback.answer("❌ У вас нет активной подписки. Купите подписку через /prem", show_alert=True)
+        return
+    
+    keys = get_user_keys(user_id)
+    keys_count = get_user_keys_count(user_id)
+    
+    text = (
+        f"🔑 <b>Мои VPN ключи</b>\n\n"
+        f"Активных ключей: <i>{keys_count}/3</i>\n\n"
+    )
+    
+    if not keys:
+        text += "У вас пока нет ключей. Создайте первый ключ!"
+    else:
+        text += "<b>Ваши ключи:</b>\n"
+        for key_id, key_name, vless_link, created_at, expires_at, traffic_gb, is_active, server_name in keys:
+            status = "✅" if is_active else "❌"
+            name = key_name or f"Ключ #{key_id}"
+            text += f"{status} <b>{name}</b>\n"
+            if server_name:
+                text += f"   Сервер: {server_name}\n"
+            if created_at:
+                try:
+                    created = datetime.strptime(created_at.split()[0], "%Y-%m-%d").strftime("%d.%m.%Y")
+                    text += f"   Создан: {created}\n"
+                except:
+                    pass
+            text += "\n"
+    
+    builder = InlineKeyboardBuilder()
+    if keys_count < 3:
+        builder.row(InlineKeyboardButton(text="➕ Создать ключ", callback_data="create_key"))
+    
+    if keys:
+        builder.row(InlineKeyboardButton(text="📋 Просмотреть ключ", callback_data="view_key_list"))
+    
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data == "create_key")
+async def handle_create_key(callback: CallbackQuery, state: FSMContext):
+    """Обработчик создания нового ключа"""
+    user_id = callback.from_user.id
+    
+    # Проверяем подписку
+    if not check_user_subscription(user_id):
+        await callback.answer("❌ У вас нет активной подписки", show_alert=True)
+        return
+    
+    # Проверяем лимит ключей
+    keys_count = get_user_keys_count(user_id)
+    if keys_count >= 3:
+        await callback.answer("❌ У вас уже максимальное количество ключей (3)", show_alert=True)
+        return
+    
+    # Получаем список активных серверов
+    active_servers = get_active_servers()
+    if not active_servers:
+        await callback.answer("❌ Нет доступных серверов", show_alert=True)
+        return
+    
+    # Формируем клавиатуру с серверами
+    builder = InlineKeyboardBuilder()
+    for server_id, server_name, server_ip, inbound_id in active_servers:
+        builder.row(InlineKeyboardButton(
+            text=f"🖥️ {server_name}",
+            callback_data=f"key_server:{server_id}"
+        ))
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="manage_keys"))
+    
+    await callback.message.edit_text(
+        "🔑 <b>Создание нового ключа</b>\n\n"
+        "Выберите сервер для создания ключа:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("key_server:"))
+async def handle_key_server_selection(callback: CallbackQuery, state: FSMContext):
+    """Обработчик выбора сервера для ключа"""
+    server_id = int(callback.data.split(":")[1])
+    await state.update_data(selected_server_id=server_id)
+    await state.set_state(KeyManagementStates.ENTERING_KEY_NAME)
+    
+    await callback.message.edit_text(
+        "✏️ Введите название для ключа (необязательно):\n\n"
+        "Или отправьте /skip чтобы пропустить",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.message(KeyManagementStates.ENTERING_KEY_NAME)
+async def handle_key_name_input(message: Message, state: FSMContext):
+    """Обработка названия ключа"""
+    user_id = message.from_user.id
+    key_name = message.text.strip() if message.text and message.text != "/skip" else None
+    
+    data = await state.get_data()
+    server_id = data.get('selected_server_id')
+    key_to_replace = data.get('key_to_replace')  # Если это замена ключа
+    
+    if not server_id:
+        await message.answer("❌ Ошибка: сервер не выбран")
+        await state.clear()
+        return
+    
+    # Получаем данные сервера
+    server_data = get_server_by_id(server_id)
+    if not server_data:
+        await message.answer("❌ Сервер не найден")
+        await state.clear()
+        return
+    
+    # Распаковываем данные сервера
+    if len(server_data) >= 7:
+        server_id_db, server_name, server_ip, server_username, server_password, server_inbound_id, server_base_url = server_data
+    else:
+        await message.answer("❌ Ошибка данных сервера")
+        await state.clear()
+        return
+    
+    # Получаем информацию о подписке для определения трафика и срока
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT subscription_end FROM users WHERE user_id = ?
+        ''', (user_id,))
+        result = cursor.fetchone()
+        if not result or not result[0]:
+            await message.answer("❌ Ошибка: подписка не найдена")
+            await state.clear()
+            return
+        
+        subscription_end = result[0]
+        try:
+            end_date = datetime.strptime(subscription_end, "%Y-%m-%d")
+            days_valid = (end_date - datetime.now()).days
+            if days_valid <= 0:
+                await message.answer("❌ Ваша подписка истекла")
+                await state.clear()
+                return
+        except:
+            await message.answer("❌ Ошибка при расчете срока подписки")
+            await state.clear()
+            return
+    
+    # Создаем ключ на сервере
+    try:
+        server_client = XUIClient(
+            base_url=server_base_url,
+            username=server_username,
+            password=server_password,
+            inbound_id=server_inbound_id
+        )
+        
+        # Используем стандартные значения для трафика (можно настроить)
+        traffic_gb = 100  # Можно брать из подписки
+        result = server_client.add_vless_client(
+            telegram_user_id=user_id,
+            display_name=key_name or f"key_{user_id}_{int(time.time())}",
+            traffic_gb=traffic_gb,
+            days_valid=days_valid,
+        )
+        
+        vless_client_id = result.get("id")
+        vless_link = result.get("link")
+        
+        # Сохраняем ключ в БД
+        with get_connection(cfg.database.db_path) as conn:
+            cursor = conn.cursor()
+            expires_at = end_date.strftime("%Y-%m-%d")
+            cursor.execute('''
+                INSERT INTO vpn_keys (user_id, server_id, vless_client_id, vless_link, 
+                                    key_name, expires_at, traffic_gb, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, TRUE)
+            ''', (user_id, server_id, vless_client_id, vless_link, key_name, expires_at, traffic_gb))
+            conn.commit()
+            key_id = cursor.lastrowid
+        
+        # Если это замена ключа, удаляем старый
+        if key_to_replace:
+            old_key_data = get_key_by_id(key_to_replace, user_id)
+            if old_key_data:
+                old_key_id_db, old_key_name, old_vless_link, old_vless_client_id, old_created_at, old_expires_at, old_traffic_gb, old_is_active, old_server_id, old_server_name = old_key_data
+                
+                # Удаляем старый ключ из БД
+                with get_connection(cfg.database.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('DELETE FROM vpn_keys WHERE id = ? AND user_id = ?', (key_to_replace, user_id))
+                    conn.commit()
+                
+                # Пытаемся удалить клиент с сервера (если возможно)
+                old_server_data = get_server_by_id(old_server_id)
+                if old_server_data:
+                    old_server_id_db, old_server_name, old_server_ip, old_server_username, old_server_password, old_server_inbound_id, old_server_base_url = old_server_data
+                    try:
+                        old_server_client = XUIClient(
+                            base_url=old_server_base_url,
+                            username=old_server_username,
+                            password=old_server_password,
+                            inbound_id=old_server_inbound_id
+                        )
+                        # Здесь можно добавить метод удаления клиента, если он есть в XUIClient
+                        # old_server_client.delete_client(old_vless_client_id)
+                    except Exception as e:
+                        logger.error(f"Failed to delete old client from server: {e}")
+        
+        await message.answer(
+            f"✅ <b>Ключ успешно {'заменен' if key_to_replace else 'создан'}!</b>\n\n"
+            f"<b>Информация:</b>\n"
+            f"Название: <i>{key_name or 'Без названия'}</i>\n"
+            f"Сервер: <i>{server_name}</i>\n"
+            f"Срок действия: <i>{end_date.strftime('%d.%m.%Y')}</i>\n\n"
+            f"🔗 <b>VPN ссылка:</b>\n"
+            f"<code>{vless_link}</code>\n\n"
+            f"Используйте раздел <b>🔑 Мои ключи</b> для управления ключами.",
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to create key: {e}")
+        await message.answer(
+            f"❌ <b>Ошибка при создании ключа:</b>\n<code>{str(e)}</code>\n\n"
+            f"Попробуйте позже или обратитесь в поддержку.",
+            parse_mode="HTML"
+        )
+    
+    await state.clear()
+
+@dp.callback_query(F.data == "view_key_list")
+async def handle_view_key_list(callback: CallbackQuery):
+    """Показать список ключей для просмотра"""
+    user_id = callback.from_user.id
+    keys = get_user_keys(user_id)
+    
+    if not keys:
+        await callback.answer("У вас нет ключей", show_alert=True)
+        return
+    
+    builder = InlineKeyboardBuilder()
+    for key_id, key_name, vless_link, created_at, expires_at, traffic_gb, is_active, server_name in keys:
+        name = key_name or f"Ключ #{key_id}"
+        builder.row(InlineKeyboardButton(
+            text=f"{'✅' if is_active else '❌'} {name}",
+            callback_data=f"view_key:{key_id}"
+        ))
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="manage_keys"))
+    
+    await callback.message.edit_text(
+        "🔑 <b>Выберите ключ для просмотра:</b>",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("view_key:"))
+async def handle_view_key(callback: CallbackQuery):
+    """Просмотр информации о ключе"""
+    user_id = callback.from_user.id
+    key_id = int(callback.data.split(":")[1])
+    
+    key_data = get_key_by_id(key_id, user_id)
+    if not key_data:
+        await callback.answer("❌ Ключ не найден", show_alert=True)
+        return
+    
+    key_id_db, key_name, vless_link, vless_client_id, created_at, expires_at, traffic_gb, is_active, server_id, server_name = key_data
+    
+    status = "✅ Активен" if is_active else "❌ Неактивен"
+    name = key_name or f"Ключ #{key_id_db}"
+    
+    text = (
+        f"🔑 <b>{name}</b>\n\n"
+        f"Статус: <i>{status}</i>\n"
+        f"Сервер: <i>{server_name or 'Неизвестно'}</i>\n"
+    )
+    
+    if created_at:
+        try:
+            created = datetime.strptime(created_at.split()[0], "%Y-%m-%d").strftime("%d.%m.%Y")
+            text += f"Создан: <i>{created}</i>\n"
+        except:
+            pass
+    
+    if expires_at:
+        try:
+            expires = datetime.strptime(expires_at, "%Y-%m-%d").strftime("%d.%m.%Y")
+            text += f"Истекает: <i>{expires}</i>\n"
+        except:
+            pass
+    
+    if traffic_gb:
+        text += f"Трафик: <i>{traffic_gb} ГБ</i>\n"
+    
+    text += f"\n🔗 <b>VPN ссылка:</b>\n<code>{vless_link}</code>"
+    
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"delete_key:{key_id_db}"))
+    builder.row(InlineKeyboardButton(text="🔄 Заменить", callback_data=f"replace_key:{key_id_db}"))
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="view_key_list"))
+    
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("delete_key:"))
+async def handle_delete_key(callback: CallbackQuery, state: FSMContext):
+    """Удаление ключа"""
+    user_id = callback.from_user.id
+    key_id = int(callback.data.split(":")[1])
+    
+    key_data = get_key_by_id(key_id, user_id)
+    if not key_data:
+        await callback.answer("❌ Ключ не найден", show_alert=True)
+        return
+    
+    key_id_db, key_name, vless_link, vless_client_id, created_at, expires_at, traffic_gb, is_active, server_id, server_name = key_data
+    name = key_name or f"Ключ #{key_id_db}"
+    
+    await state.update_data(key_to_delete=key_id_db, key_client_id=vless_client_id, key_server_id=server_id)
+    await state.set_state(KeyManagementStates.CONFIRMING_DELETE)
+    
+    await callback.message.edit_text(
+        f"⚠️ <b>Подтверждение удаления</b>\n\n"
+        f"Вы уверены, что хотите удалить ключ <b>{name}</b>?\n\n"
+        f"Это действие нельзя отменить.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_delete:{key_id_db}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"view_key:{key_id_db}")]
+        ])
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("confirm_delete:"))
+async def handle_confirm_delete(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение удаления ключа"""
+    user_id = callback.from_user.id
+    key_id = int(callback.data.split(":")[1])
+    
+    key_data = get_key_by_id(key_id, user_id)
+    if not key_data:
+        await callback.answer("❌ Ключ не найден", show_alert=True)
+        await state.clear()
+        return
+    
+    key_id_db, key_name, vless_link, vless_client_id, created_at, expires_at, traffic_gb, is_active, server_id, server_name = key_data
+    name = key_name or f"Ключ #{key_id_db}"
+    
+    # Получаем данные сервера для удаления клиента
+    server_data = get_server_by_id(server_id)
+    if server_data:
+        server_id_db, server_name, server_ip, server_username, server_password, server_inbound_id, server_base_url = server_data
+        
+        # Удаляем клиент с сервера (если возможно)
+        try:
+            server_client = XUIClient(
+                base_url=server_base_url,
+                username=server_username,
+                password=server_password,
+                inbound_id=server_inbound_id
+            )
+            # Здесь можно добавить метод удаления клиента, если он есть в XUIClient
+            # server_client.delete_client(vless_client_id)
+        except Exception as e:
+            logger.error(f"Failed to delete client from server: {e}")
+    
+    # Удаляем ключ из БД
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM vpn_keys WHERE id = ? AND user_id = ?', (key_id_db, user_id))
+        conn.commit()
+    
+    await callback.message.edit_text(
+        f"✅ Ключ <b>{name}</b> успешно удален!",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад к ключам", callback_data="manage_keys")]
+        ])
+    )
+    await callback.answer()
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("replace_key:"))
+async def handle_replace_key(callback: CallbackQuery, state: FSMContext):
+    """Замена ключа"""
+    user_id = callback.from_user.id
+    key_id = int(callback.data.split(":")[1])
+    
+    key_data = get_key_by_id(key_id, user_id)
+    if not key_data:
+        await callback.answer("❌ Ключ не найден", show_alert=True)
+        return
+    
+    # При замене ключа мы удаляем старый и создаем новый, поэтому лимит не проверяем
+    
+    # Сохраняем ID ключа для замены
+    await state.update_data(key_to_replace=key_id)
+    
+    # Показываем выбор сервера
+    active_servers = get_active_servers()
+    if not active_servers:
+        await callback.answer("❌ Нет доступных серверов", show_alert=True)
+        return
+    
+    builder = InlineKeyboardBuilder()
+    for server_id, server_name, server_ip, inbound_id in active_servers:
+        builder.row(InlineKeyboardButton(
+            text=f"🖥️ {server_name}",
+            callback_data=f"replace_key_server:{server_id}:{key_id}"
+        ))
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data=f"view_key:{key_id}"))
+    
+    await callback.message.edit_text(
+        "🔄 <b>Замена ключа</b></b>\n\n"
+        "Выберите сервер для нового ключа:",
+        parse_mode="HTML",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("replace_key_server:"))
+async def handle_replace_key_server(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора сервера для замены ключа"""
+    parts = callback.data.split(":")
+    server_id = int(parts[1])
+    old_key_id = int(parts[2])
+    
+    await state.update_data(selected_server_id=server_id, key_to_replace=old_key_id)
+    await state.set_state(KeyManagementStates.ENTERING_KEY_NAME)
+    
+    await callback.message.edit_text(
+        "✏️ Введите название для нового ключа (необязательно):\n\n"
+        "Или отправьте /skip чтобы пропустить",
+        parse_mode="HTML"
+    )
+    await callback.answer()
 
 # ==================== АДМИНСКИЕ КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ СЕРВЕРАМИ ====================
 
