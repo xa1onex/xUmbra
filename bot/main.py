@@ -166,7 +166,7 @@ def get_main_text(callback: CallbackQuery):
         "<i>/prem</i> - Покупка VPN\n"
         "<i>/invite</i> - Пригласи друга\n\n"
         "<code>!!!ВНИМАНИЕ!!! Это бета-тест, VPN работает нестабильно, платежи также находятся в тестировании - они не реальны!!!\n"
-        "b1.1.5</code>"
+        "b1.1.6</code>"
     )
 
 @dp.message(CommandStart())
