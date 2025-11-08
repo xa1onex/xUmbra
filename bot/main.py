@@ -281,23 +281,44 @@ async def handle_sub_info(message_or_callback: Message | CallbackQuery, state: F
     user_id = message.from_user.id
     with get_connection(cfg.database.db_path) as conn:
         cursor = conn.cursor()
-        # Получаем все данные пользователя, без фильтрации по дате в SQL
-        cursor.execute('''
-            SELECT 
-                subscription_end,
-                vless_link,
-                pay_subscribed
-            FROM users 
-            WHERE user_id = ?
-        ''', (user_id,))
-        result = cursor.fetchone()
+        # Получаем данные пользователя - работаем с тем что есть
+        # Сначала проверяем, какие колонки есть в таблице
+        cursor.execute("PRAGMA table_info(users)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        # Формируем запрос только с существующими колонками
+        select_fields = ['subscription_end', 'pay_subscribed']
+        if 'vless_link' in columns:
+            select_fields.insert(1, 'vless_link')
+        else:
+            select_fields.insert(1, 'NULL as vless_link')
+        
+        try:
+            query = f'SELECT {", ".join(select_fields)} FROM users WHERE user_id = ?'
+            cursor.execute(query, (user_id,))
+            result = cursor.fetchone()
+        except Exception as e:
+            # Если ошибка - используем дефолтные значения
+            logger.error(f"Database error in /prem: {e}")
+            result = None
 
     builder = InlineKeyboardBuilder()
     text = "💳 <b>Информация о вашем VPN:</b>\n\n"
 
-    # Проверяем подписку как в /start - через Python
+    # Обрабатываем данные пользователя
     if result:
-        subscription_end, vless_link, pay_subscribed = result
+        # Обрабатываем результат в зависимости от количества колонок
+        if len(result) >= 3:
+            subscription_end, vless_link, pay_subscribed = result[0], result[1], result[2]
+        elif len(result) == 2:
+            # Если vless_link нет в таблице
+            subscription_end, pay_subscribed = result[0], result[1]
+            vless_link = None
+        else:
+            subscription_end = None
+            vless_link = None
+            pay_subscribed = 0
+        
         is_active = False
         
         # Проверяем, активна ли подписка
@@ -326,104 +347,119 @@ async def handle_sub_info(message_or_callback: Message | CallbackQuery, state: F
                 is_active = False
         else:
             is_active = False
+    else:
+        # Пользователь не найден в базе - используем дефолтные значения
+        subscription_end = None
+        vless_link = None
+        pay_subscribed = 0
+        is_active = False
+    
+    # Теперь обрабатываем в зависимости от статуса подписки
+    if is_active:
+        # Если подписка активна - показываем информацию и VPN ссылку
+        text = (
+            "✅ Ваш <b>VPN</b> <b>активен</b>!\n\n"
+            f"📅 Дата окончания: <i>{end_date_str}</i>\n"
+            f"⏰ Осталось дней: <i>{days_remaining}</i>\n\n"
+        )
         
-        if is_active:
-            # Если подписка активна - показываем информацию и VPN ссылку
-            text = (
-                "✅ Ваш <b>VPN</b> <b>активен</b>!\n\n"
-                f"📅 Дата окончания: <i>{end_date_str}</i>\n"
-                f"⏰ Осталось дней: <i>{days_remaining}</i>\n\n"
-            )
-            
-            # Показываем VPN ссылку если она есть
-            if vless_link:
-                text += (
-                    f"🔗 <b>Ваша VPN ссылка:</b>\n"
-                    f"<code>{vless_link}</code>\n\n"
-                    f"📱 <i>В /help можете найти инструкцию как подключиться к VPN</i>"
-                )
-            else:
-                text += (
-                    "⚠️ VPN ссылка не найдена. Обратитесь в поддержку.\n\n"
-                )
-
-            
-            # Показываем кнопки продления только если осталось <= 3 дня
-            if days_remaining <= 3:
-                text += (
-                    "🎁 <b>Специальное предложение!</b>\n\n"
-                    "🔥 Успей продлить <b>VPN</b> по специальной цене:\n"
-                    f"1 месяц <s>199₽</s> - 149₽\n"
-                    f"3 месяца <s>499₽</s> - 399₽\n"
-                    f"6 месяцев <s>899₽</s> - 749₽\n"
-                    f"12 месяцев <s>1499₽</s> - 1199₽\n\n"
-                )
-                for plan_id, plan_data in RENEWAL_PLANS.items():
-                    builder.button(
-                        text=f"{plan_data['title']} - {plan_data['price_rub'] // 100}₽ | {plan_data['price_stars']}⭐",
-                        callback_data=f"plan:{plan_id}"
-                    )
-                builder.adjust(1)
-            
-            # Кнопка "Назад" всегда
-            builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
-            
-            # Если это callback - редактируем сообщение, иначе отправляем новое
-            if is_callback:
-                await message.edit_text(
-                    text,
-                    reply_markup=builder.as_markup(),
-                    parse_mode="HTML"
-                )
-            else:
-                await message.answer(
-                    text,
-                    reply_markup=builder.as_markup(),
-                    parse_mode="HTML"
-                )
-            
-            # Устанавливаем состояние только если есть кнопки продления
-            if days_remaining <= 3:
-                await state.set_state(SubscriptionSteps.CHOOSING_PLAN)
-            else:
-                await state.clear()
-        else:
-            # Подписка неактивна - показываем планы для покупки
+        # Показываем VPN ссылку если она есть
+        if vless_link:
             text += (
-                "❌ Ваш VPN <b>неактивен</b>!\n\n"
-                "Что ты получишь с <b>VPN</b>?\n"
-                "• Быстрый и безопасный VPN\n"
-                "• Обход всех блокировок\n"
-                "• Высокая скорость подключения\n\n"
-                "Выберите план подписки:\n"
+                f"🔗 <b>Ваша VPN ссылка:</b>\n"
+                f"<code>{vless_link}</code>\n\n"
+                f"📱 <b>Как использовать:</b>\n"
+                f"1. Нажмите на ссылку выше, чтобы скопировать\n"
+                f"2. Скачайте приложение (v2rayNG, sing-box и т.п.)\n"
+                f"3. Импортируйте ссылку в приложение\n"
+                f"4. Подключитесь!\n\n"
             )
-            for plan_id, plan_data in SUBSCRIPTION_PLANS.items():
+        else:
+            text += (
+                "⚠️ VPN ссылка не найдена. Обратитесь в поддержку.\n\n"
+            )
+        
+        text += (
+            "<b>Детали VPN</b>:\n"
+            "• Быстрый и безопасный VPN\n"
+            "• Обход всех блокировок\n"
+            "• Высокая скорость\n\n"
+        )
+        
+        # Показываем кнопки продления только если осталось <= 3 дня
+        if days_remaining <= 3:
+            text += (
+                "🎁 <b>Специальное предложение!</b>\n\n"
+                "🔥 Успей продлить <b>VPN</b> по специальной цене:\n"
+                f"1 месяц <s>199₽</s> - 149₽\n"
+                f"3 месяца <s>499₽</s> - 399₽\n"
+                f"6 месяцев <s>899₽</s> - 749₽\n"
+                f"12 месяцев <s>1499₽</s> - 1199₽\n\n"
+            )
+            for plan_id, plan_data in RENEWAL_PLANS.items():
                 builder.button(
                     text=f"{plan_data['title']} - {plan_data['price_rub'] // 100}₽ | {plan_data['price_stars']}⭐",
                     callback_data=f"plan:{plan_id}"
                 )
             builder.adjust(1)
-            builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
-
-            if is_callback:
-                await message.edit_text(
-                    text,
-                    reply_markup=builder.as_markup(),
-                    parse_mode="HTML"
-                )
-            else:
-                await message.answer(
-                    text,
-                    reply_markup=builder.as_markup(),
-                    parse_mode="HTML"
-                )
+        else:
+            text += "💡 Ваша подписка активна. Вы сможете продлить её за 3 дня до окончания.\n\n"
+        
+        # Кнопка "Назад" всегда
+        builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
+        
+        # Если это callback - редактируем сообщение, иначе отправляем новое
+        if is_callback:
+            await message.edit_text(
+                text,
+                reply_markup=builder.as_markup(),
+                parse_mode="HTML"
+            )
+        else:
+            await message.answer(
+                text,
+                reply_markup=builder.as_markup(),
+                parse_mode="HTML"
+            )
+        
+        # Устанавливаем состояние только если есть кнопки продления
+        if days_remaining <= 3:
             await state.set_state(SubscriptionSteps.CHOOSING_PLAN)
+        else:
+            await state.clear()
     else:
-        # Пользователь не найден в базе
+        # Если подписка неактивна или пользователя нет - показываем планы
+        # Подписка неактивна - показываем планы для покупки
+        text = "💳 <b>Информация о вашем VPN:</b>\n\n"
         text += (
-            "❌ Вы не зарегистрированы! Используйте /start для регистрации."
+            "❌ Ваш VPN <b>неактивен</b>!\n\n"
+            "Что ты получишь с <b>VPN</b>?\n"
+            "• Быстрый и безопасный VPN\n"
+            "• Обход всех блокировок\n"
+            "• Высокая скорость подключения\n\n"
+            "Выберите план подписки:\n"
         )
-        await message.answer(text, parse_mode="HTML")
+        for plan_id, plan_data in SUBSCRIPTION_PLANS.items():
+            builder.button(
+                text=f"{plan_data['title']} - {plan_data['price_rub'] // 100}₽ | {plan_data['price_stars']}⭐",
+                callback_data=f"plan:{plan_id}"
+            )
+        builder.adjust(1)
+        builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
+
+        if is_callback:
+            await message.edit_text(
+                text,
+                reply_markup=builder.as_markup(),
+                parse_mode="HTML"
+            )
+        else:
+            await message.answer(
+                text,
+                reply_markup=builder.as_markup(),
+                parse_mode="HTML"
+            )
+        await state.set_state(SubscriptionSteps.CHOOSING_PLAN)
 
 @dp.callback_query(SubscriptionSteps.CHOOSING_PLAN, F.data.startswith("plan:"))
 async def select_plan(callback: CallbackQuery, state: FSMContext):
@@ -464,7 +500,7 @@ async def select_plan(callback: CallbackQuery, state: FSMContext):
             await callback.answer("❌ У вас нет активной подписки для продления!", show_alert=True)
             await handle_sub_info(callback, state)
             return
-        
+
         cursor.execute('''
             SELECT julianday(subscription_end) - julianday('now') as days_remaining 
             FROM users 
@@ -578,7 +614,7 @@ async def process_successful_payment(message: Message):
                 result = xui_client.add_vless_client(
                     telegram_user_id=user_id,
                     display_name=username,
-                    traffic_gb=traffic_gb,
+                traffic_gb=traffic_gb,
                     days_valid=duration_months * 30,
                 )
                 vless_client_id = result.get("id")
@@ -689,28 +725,64 @@ async def handle_open_invite(message_or_callback: Message | CallbackQuery):
 
     with get_connection(cfg.database.db_path) as conn:
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT referral_code, referral_count 
-            FROM users 
-            WHERE user_id = ?
-        ''', (user_id,))
-        result = cursor.fetchone()
-
-        if not result:
-            await message.answer("❌ Сначала запустите бота через /start")
+        # Получаем данные пользователя - работаем с тем что есть
+        try:
+            cursor.execute('''
+                SELECT referral_code, referral_count 
+                FROM users 
+                WHERE user_id = ?
+            ''', (user_id,))
+            result = cursor.fetchone()
+        except Exception as e:
+            # Если таблица или колонки не существуют - показываем сообщение
+            logger.error(f"Database error in /invite: {e}")
+            if isinstance(message_or_callback, CallbackQuery):
+                await message_or_callback.message.edit_text(
+                    "❌ Ошибка при получении данных. Попробуйте позже или используйте /start.",
+                    parse_mode="HTML"
+                )
+            else:
+                await message.answer(
+                    "❌ Ошибка при получении данных. Попробуйте позже или используйте /start.",
+                    parse_mode="HTML"
+                )
             return
 
+        # Обрабатываем данные пользователя
+        if not result:
+            # Пользователь не найден - показываем сообщение
+            if isinstance(message_or_callback, CallbackQuery):
+                await message_or_callback.message.edit_text(
+                    "❌ Вы не зарегистрированы в системе.\n\n"
+                    "Пожалуйста, используйте команду /start для регистрации.",
+                    parse_mode="HTML"
+                )
+            else:
+                await message.answer(
+                    "❌ Вы не зарегистрированы в системе.\n\n"
+                    "Пожалуйста, используйте команду /start для регистрации.",
+                    parse_mode="HTML"
+                )
+            return
+        
         referral_code, referral_count = result
-
-        # Если код по какой-то причине отсутствует в БД
+        
+        # Если код по какой-то причине отсутствует в БД - создаем его
         if not referral_code:
             referral_code = secrets.token_hex(4)
-            cursor.execute('''
-                UPDATE users
-                SET referral_code = ?
-                WHERE user_id = ?
-            ''', (referral_code, user_id))
-            conn.commit()
+            try:
+                cursor.execute('''
+                    UPDATE users
+                    SET referral_code = ?
+                    WHERE user_id = ?
+                ''', (referral_code, user_id))
+                conn.commit()
+            except Exception as e:
+                logger.error(f"Failed to update referral_code: {e}")
+        
+        # Обновляем referral_count если он None
+        if referral_count is None:
+            referral_count = 0
 
     bot_username = (await bot.get_me()).username
     ref_link = f"https://t.me/{bot_username}?start=ref_{referral_code}"
@@ -729,7 +801,11 @@ async def handle_open_invite(message_or_callback: Message | CallbackQuery):
         [InlineKeyboardButton(text="◀️ Назад", callback_data="go_back")]
     ])
 
-    await message.answer(text, parse_mode='HTML', reply_markup=keyboard)
+    # Проверяем, это callback или message
+    if isinstance(message_or_callback, CallbackQuery):
+        await message_or_callback.message.edit_text(text, parse_mode='HTML', reply_markup=keyboard)
+    else:
+        await message.answer(text, parse_mode='HTML', reply_markup=keyboard)
 
 @dp.callback_query(F.data == "go_back")
 async def go_back_handler(callback: CallbackQuery):
@@ -783,7 +859,7 @@ async def handle_open_help(message_or_callback: Message | CallbackQuery):
         [InlineKeyboardButton(text="◀️ Назад", callback_data="go_back")]
     ])
 
-    await message.answercallback.message.edit_text(
+    help_text = (
         "🤖<b>VPN бот</b> — быстрый и надежный VPN сервис\n\n"
         "<b>Бот предоставляет</b>:\n"
         "• Быстрый и безопасный VPN\n"
@@ -801,10 +877,21 @@ async def handle_open_help(message_or_callback: Message | CallbackQuery):
         "📌 <b>Команды</b>:\n"
         "/start - Перезагрузить бота\n"
         "/prem - Покупка VPN\n"
-        "/invite - Пригласи друга\n",
-        reply_markup=report_button,
-        parse_mode="HTML"
+        "/invite - Пригласи друга\n"
     )
+
+    if isinstance(message_or_callback, CallbackQuery):
+        await message_or_callback.message.edit_text(
+            help_text,
+            reply_markup=report_button,
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            help_text,
+            reply_markup=report_button,
+            parse_mode="HTML"
+        )
 
 async def daily_scheduler():
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")

@@ -28,11 +28,27 @@ def init_db(db_path: str = DATABASE_FILE):
                 subscribed BOOLEAN DEFAULT FALSE,
                 renewal_used BOOLEAN DEFAULT FALSE,
                 ban_reason TEXT DEFAULT '',
-                last_announce TEXT,
-                vless_client_id TEXT,
-                vless_link TEXT
+                last_announce TEXT
             )
         ''')
+        
+        # Проверяем и добавляем колонки для VPN, если их нет
+        cursor.execute("PRAGMA table_info(users)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'vless_client_id' not in columns:
+            try:
+                cursor.execute('ALTER TABLE users ADD COLUMN vless_client_id TEXT')
+                logging.info("Added vless_client_id column to users table")
+            except Exception as e:
+                logging.warning(f"Could not add vless_client_id column: {e}")
+        
+        if 'vless_link' not in columns:
+            try:
+                cursor.execute('ALTER TABLE users ADD COLUMN vless_link TEXT')
+                logging.info("Added vless_link column to users table")
+            except Exception as e:
+                logging.warning(f"Could not add vless_link column: {e}")
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS subscriptions (
