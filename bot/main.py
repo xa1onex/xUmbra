@@ -713,83 +713,41 @@ async def process_successful_payment(message: Message):
         )
 
 @dp.callback_query(F.data == "open_invite")
-@dp.message(Command("invite"))
-async def handle_open_invite(message_or_callback: Message | CallbackQuery):
-    if isinstance(message_or_callback, CallbackQuery):
-        message = message_or_callback.message
-        await message_or_callback.answer()
-    else:
-        message = message_or_callback
-    
-    user_id = message.from_user.id
+async def handle_open_invite_callback(callback: CallbackQuery):
+    """Обработчик кнопки Рефералка (callback)"""
+    user_id = callback.from_user.id
 
     with get_connection(cfg.database.db_path) as conn:
         cursor = conn.cursor()
-        # Получаем данные пользователя - работаем с тем что есть
-        try:
-            cursor.execute('''
-                SELECT referral_code, referral_count 
-                FROM users 
-                WHERE user_id = ?
-            ''', (user_id,))
-            result = cursor.fetchone()
-        except Exception as e:
-            # Если таблица или колонки не существуют - показываем сообщение
-            logger.error(f"Database error in /invite: {e}")
-            if isinstance(message_or_callback, CallbackQuery):
-                await message_or_callback.message.edit_text(
-                    "❌ Ошибка при получении данных. Попробуйте позже или используйте /start.",
-                    parse_mode="HTML"
-                )
-            else:
-                await message.answer(
-                    "❌ Ошибка при получении данных. Попробуйте позже или используйте /start.",
-                    parse_mode="HTML"
-                )
+        cursor.execute('''
+            SELECT referral_code, referral_count 
+            FROM users 
+            WHERE user_id = ?
+        ''', (user_id,))
+        result = cursor.fetchone()
+
+        if not result:
+            await callback.answer("❌ Сначала запустите бота через /start", show_alert=True)
             return
 
-        # Обрабатываем данные пользователя
-        if not result:
-            # Пользователь не найден - показываем сообщение
-            if isinstance(message_or_callback, CallbackQuery):
-                await message_or_callback.message.edit_text(
-                    "❌ Вы не зарегистрированы в системе.\n\n"
-                    "Пожалуйста, используйте команду /start для регистрации.1",
-                    parse_mode="HTML"
-                )
-            else:
-                await message.answer(
-                    "❌ Вы не зарегистрированы в системе.\n\n"
-                    "Пожалуйста, используйте команду /start для регистрации.",
-                    parse_mode="HTML"
-                )
-            return
-        
         referral_code, referral_count = result
-        
-        # Если код по какой-то причине отсутствует в БД - создаем его
+
+        # Если код по какой-то причине отсутствует в БД
         if not referral_code:
             referral_code = secrets.token_hex(4)
-            try:
-                cursor.execute('''
-                    UPDATE users
-                    SET referral_code = ?
-                    WHERE user_id = ?
-                ''', (referral_code, user_id))
-                conn.commit()
-            except Exception as e:
-                logger.error(f"Failed to update referral_code: {e}")
-        
-        # Обновляем referral_count если он None
-        if referral_count is None:
-            referral_count = 0
+            cursor.execute('''
+                UPDATE users
+                SET referral_code = ?
+                WHERE user_id = ?
+            ''', (referral_code, user_id))
+            conn.commit()
 
     bot_username = (await bot.get_me()).username
     ref_link = f"https://t.me/{bot_username}?start=ref_{referral_code}"
     text = (
         f"🎁 <b>Пригласи друга и получи +5 дней VPN!</b>\n\n"
         f"🔗 Ваша реферальная ссылка:\n<code>{ref_link}</code>\n\n"
-        f"👥 Приглашено друзей: <i>{referral_count}</i>\n"
+        f"👥 Приглашено друзей: <i>{referral_count or 0}</i>\n"
         f"За каждого друга вы получаете +5 дней VPN, а друг получает +3 дня!"
     )
 
@@ -801,11 +759,59 @@ async def handle_open_invite(message_or_callback: Message | CallbackQuery):
         [InlineKeyboardButton(text="◀️ Назад", callback_data="go_back")]
     ])
 
-    # Проверяем, это callback или message
-    if isinstance(message_or_callback, CallbackQuery):
-        await message_or_callback.message.edit_text(text, parse_mode='HTML', reply_markup=keyboard)
-    else:
-        await message.answer(text, parse_mode='HTML', reply_markup=keyboard)
+    # Редактируем исходное сообщение с кнопкой
+    await callback.message.edit_text(text, parse_mode='HTML', reply_markup=keyboard)
+    await callback.answer()
+
+@dp.message(Command("invite"))
+async def handle_invite_command(message: Message):
+    """Обработчик команды /invite"""
+    user_id = message.from_user.id
+
+    with get_connection(cfg.database.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT referral_code, referral_count 
+            FROM users 
+            WHERE user_id = ?
+        ''', (user_id,))
+        result = cursor.fetchone()
+
+        if not result:
+            await message.answer("❌ Пожалуйста, сначала запустите бота с помощью команды /start")
+            return
+
+        referral_code, referral_count = result
+
+        # Если реферальный код отсутствует, генерируем новый
+        if not referral_code:
+            referral_code = secrets.token_hex(4)
+            cursor.execute('''
+                UPDATE users
+                SET referral_code = ?
+                WHERE user_id = ?
+            ''', (referral_code, user_id))
+            conn.commit()
+
+    bot_username = (await bot.get_me()).username
+    ref_link = f"https://t.me/{bot_username}?start=ref_{referral_code}"
+    text = (
+        f"🎁 <b>Пригласи друга и получи +5 дней VPN!</b>\n\n"
+        f"🔗 Ваша реферальная ссылка:\n<code>{ref_link}</code>\n\n"
+        f"👥 Приглашено друзей: <i>{referral_count or 0}</i>\n"
+        f"За каждого друга вы получаете +5 дней VPN, а друг получает +3 дня!"
+    )
+
+    # Клавиатура с кнопкой поделиться
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="📤 Поделиться",
+            url=f"https://t.me/share/url?url={ref_link}&text={quote('Присоединяйся к VPN боту с моей подпиской!')}"
+        )],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="go_back")]
+    ])
+
+    await message.answer(text, parse_mode='HTML', reply_markup=keyboard)
 
 @dp.callback_query(F.data == "go_back")
 async def go_back_handler(callback: CallbackQuery):
