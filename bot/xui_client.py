@@ -41,6 +41,9 @@ class XUIClient:
         """Инициализация клиента. Можно использовать cfg или отдельные параметры сервера"""
         if cfg:
             self.base_url = cfg.base_url
+            # Убеждаемся, что base_url заканчивается на /
+            if self.base_url and not self.base_url.endswith('/'):
+                self.base_url += '/'
             self.username = cfg.username
             self.password = cfg.password
             self.api_token = cfg.api_token
@@ -48,14 +51,21 @@ class XUIClient:
         else:
             if not base_url:
                 raise ValueError("Either cfg or base_url must be provided")
-            self.base_url = base_url.rstrip("/") if base_url else None
+            # Сохраняем base_url как есть (он уже должен заканчиваться на /)
+            # Не добавляем лишний /, чтобы не нарушить путь, если он уже есть
+            self.base_url = base_url if base_url else None
+            # Если base_url не заканчивается на /, добавляем его
+            if self.base_url and not self.base_url.endswith('/'):
+                self.base_url += '/'
             self.username = username
             self.password = password
             self.api_token = api_token
             self.inbound_id = inbound_id
         
-        # Определяем, нужно ли использовать SSL
-        use_ssl = self.base_url.startswith('https://')
+        # Создаем HTTP клиент
+        # httpx автоматически обрабатывает пути в base_url
+        # Например: base_url="http://host:port/path/" + endpoint="/panel/api/..." 
+        # даст "http://host:port/path/panel/api/..."
         self._client = httpx.Client(
             base_url=self.base_url, 
             timeout=20.0, 
@@ -76,12 +86,22 @@ class XUIClient:
         if not (self.username and self.password):
             raise RuntimeError("Either API_TOKEN or USERNAME/PASSWORD must be provided")
         # Try common 3x-ui login route
-        resp = self._client.post(
-            "/login", data={"username": self.username, "password": self.password}
-        )
-        if resp.status_code not in (200, 302):
-            raise RuntimeError(f"x-ui login failed: {resp.status_code} {resp.text}")
-        self._authorized = True
+        # Путь /login будет автоматически добавлен к base_url
+        # Например: http://host:port/path/ + /login = http://host:port/path/login
+        try:
+            resp = self._client.post(
+                "login",  # Без начального /, чтобы httpx правильно объединил с base_url
+                data={"username": self.username, "password": self.password}
+            )
+            if resp.status_code not in (200, 302):
+                raise RuntimeError(f"x-ui login failed: {resp.status_code} {resp.text}")
+            self._authorized = True
+        except httpx.ConnectError as e:
+            raise RuntimeError(f"Connection error: {e}")
+        except httpx.TimeoutException as e:
+            raise RuntimeError(f"Connection timeout: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Login error: {e}")
 
     def ensure_login(self) -> None:
         if not self._authorized:
@@ -126,8 +146,9 @@ class XUIClient:
             "settings": json.dumps({"clients": [client_dict]})
         }
         headers = {"Content-Type": "application/json", **self._auth_headers()}
-        endpoint = "/panel/api/inbounds/addClient"
-        print(f"[xui] POST {endpoint} payload: {payload}")
+        # Используем путь без начального /, чтобы httpx правильно объединил с base_url
+        endpoint = "panel/api/inbounds/addClient"
+        print(f"[xui] POST {self.base_url}{endpoint} payload: {payload}")
         resp = self._client.post(endpoint, json=payload, headers=headers)
         print(f"[xui] Status={resp.status_code} Response={resp.text}")
         if resp.status_code != 200:
@@ -137,7 +158,7 @@ class XUIClient:
             raise RuntimeError(f"addClient error: {data}")
 
         # Теперь получим данные inbound через лист (для формирования корректной ссылки)
-        inbs = self._client.get("/panel/api/inbounds/list").json().get("obj", [])
+        inbs = self._client.get("panel/api/inbounds/list").json().get("obj", [])
         chosen=None
         for i in inbs:
             if i.get('id') == inbound_id:
@@ -166,7 +187,7 @@ class XUIClient:
         server_ip = chosen.get('listen') or ''
         if not server_ip or server_ip == '0.0.0.0' or server_ip == '':
             # Берем IP из base_url
-            server_ip = self.cfg.base_url.split('//')[-1].split(':')[0]
+            server_ip = self.base_url.split('//')[-1].split(':')[0]
         
         # Формируем ссылку vless в правильном порядке параметров
         link = f"vless://{client_uuid}@{server_ip}:{port}/?type=tcp&encryption=none&security=reality"
