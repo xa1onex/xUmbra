@@ -1305,7 +1305,13 @@ async def handle_key_server_selection(callback: CallbackQuery, state: FSMContext
                 await callback.answer("❌ Ваша подписка истекла", show_alert=True)
                 await state.clear()
                 return
-        except:
+            
+            # Вычисляем expiry_time в миллисекундах (unix timestamp * 1000)
+            # Устанавливаем время окончания на конец дня (23:59:59)
+            from datetime import time as dt_time
+            end_datetime = datetime.combine(end_date.date(), dt_time(23, 59, 59))
+            expiry_time_unix_ms = int(end_datetime.timestamp() * 1000)
+        except Exception as e:
             await callback.answer("❌ Ошибка при расчете срока подписки", show_alert=True)
             await state.clear()
             return
@@ -1323,11 +1329,12 @@ async def handle_key_server_selection(callback: CallbackQuery, state: FSMContext
         traffic_gb = 100  # Можно брать из подписки
         
         # Создаем клиента с display_name = server_id (в конце VLESS ссылки будет server_id)
+        # Передаем expiry_time_unix_ms, чтобы ключ истекал в тот же день, что и подписка
         result = server_client.add_vless_client(
             telegram_user_id=user_id,
             display_name=str(server_id),  # В конце VLESS ссылки будет server_id
             traffic_gb=traffic_gb,
-            days_valid=days_valid,
+            expiry_time_unix_ms=expiry_time_unix_ms,  # Используем дату окончания подписки
         )
         
         vless_client_id = result.get("id")

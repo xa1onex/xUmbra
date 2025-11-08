@@ -113,12 +113,17 @@ class XUIClient:
         display_name: str,
         traffic_gb: int | None = 30,
         days_valid: int | None = 30,
+        expiry_time_unix_ms: int | None = None,
     ) -> dict[str, Any]:
         self.ensure_login()
 
         import datetime
-        now_dt = datetime.datetime.now()
-        expiry_time = int(now_dt.timestamp() * 1000) + (86400000 * (days_valid or 30))
+        # Если передан expiry_time_unix_ms, используем его, иначе вычисляем из days_valid
+        if expiry_time_unix_ms is not None:
+            expiry_time = expiry_time_unix_ms
+        else:
+            now_dt = datetime.datetime.now()
+            expiry_time = int(now_dt.timestamp() * 1000) + (86400000 * (days_valid or 30))
         client_uuid = str(uuid.uuid4())
         email = f"tg_{telegram_user_id}_{int(time.time())}@xui"
 
