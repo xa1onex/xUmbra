@@ -2100,6 +2100,212 @@ async def sync_subscriptions_and_keys(db_path: str):
     except Exception as e:
         logger.error(f"Error in sync_subscriptions_and_keys: {e}")
 
+async def send_feedback_request(db_path: str):
+    """Отправляет опрос о качестве VPN через 3 дня после покупки подписки"""
+    logger.info("Starting feedback requests...")
+    
+    try:
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Создаем таблицу feedback_ratings, если её нет
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS feedback_ratings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    payment_id INTEGER,
+                    rating INTEGER,
+                    timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Получаем платежи, которые были совершены 3 дня назад
+            cursor.execute('''
+                SELECT DISTINCT p.user_id, u.username, u.first_name
+                FROM payments p
+                JOIN users u ON p.user_id = u.user_id
+                WHERE p.status = 'completed'
+                  AND p.plan_type = 'subscription'
+                  AND DATE(p.timestamp) = DATE('now', '-3 days')
+                  AND p.id NOT IN (
+                      SELECT payment_id FROM feedback_ratings 
+                      WHERE payment_id IS NOT NULL
+                  )
+            ''')
+            users_to_notify = cursor.fetchall()
+            
+            for user_id, username, first_name in users_to_notify:
+                try:
+                    # Проверяем, что у пользователя все еще активная подписка
+                    cursor.execute('''
+                        SELECT pay_subscribed, subscription_end
+                        FROM users
+                        WHERE user_id = ? AND pay_subscribed = 1
+                          AND subscription_end >= DATE('now')
+                    ''', (user_id,))
+                    sub_check = cursor.fetchone()
+                    
+                    if not sub_check:
+                        continue
+                    
+                    # Получаем ID последнего платежа для связи с рейтингом
+                    cursor.execute('''
+                        SELECT id FROM payments
+                        WHERE user_id = ? AND status = 'completed'
+                          AND DATE(timestamp) = DATE('now', '-3 days')
+                        ORDER BY id DESC LIMIT 1
+                    ''', (user_id,))
+                    payment_result = cursor.fetchone()
+                    payment_id = payment_result[0] if payment_result else None
+                    
+                    # Отправляем опрос
+                    builder = InlineKeyboardBuilder()
+                    for rating in range(1, 6):
+                        builder.row(InlineKeyboardButton(
+                            text="⭐" * rating,
+                            callback_data=f"feedback_rating:{rating}:{payment_id or 0}"
+                        ))
+                    
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            "👋 Привет! Как тебе наш VPN?\n\n"
+                            "Поделись своим мнением, это поможет нам стать лучше!"
+                        ),
+                        reply_markup=builder.as_markup(),
+                        parse_mode="HTML"
+                    )
+                    
+                    logger.info(f"Sent feedback request to user {user_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to send feedback request to user {user_id}: {e}")
+            
+            logger.info(f"Feedback requests completed: {len(users_to_notify)} users notified")
+    
+    except Exception as e:
+        logger.error(f"Error in send_feedback_request: {e}")
+
+async def send_subscription_reminder(db_path: str):
+    """Отправляет напоминание о скидке за 3 дня до окончания подписки"""
+    logger.info("Starting subscription reminders...")
+    
+    try:
+        with get_connection(db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Получаем пользователей, у которых подписка истекает через 3 дня
+            cursor.execute('''
+                SELECT user_id, username, first_name, subscription_end
+                FROM users
+                WHERE pay_subscribed = 1
+                  AND subscription_end IS NOT NULL
+                  AND DATE(subscription_end) = DATE('now', '+3 days')
+            ''')
+            users_to_remind = cursor.fetchall()
+            
+            for user_id, username, first_name, subscription_end in users_to_remind:
+                try:
+                    # Форматируем дату окончания
+                    try:
+                        if isinstance(subscription_end, str):
+                            end_date = datetime.strptime(subscription_end.split()[0], "%Y-%m-%d")
+                        else:
+                            end_date = subscription_end
+                        end_date_str = end_date.strftime("%d.%m.%Y")
+                    except:
+                        end_date_str = subscription_end
+                    
+                    builder = InlineKeyboardBuilder()
+                    builder.row(InlineKeyboardButton(text="💎 Продлить подписку", callback_data="open_premium"))
+                    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
+                    
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            "⏰ <b>Напоминание о подписке</b>\n\n"
+                            f"Ваша VPN подписка истекает <b>через 3 дня</b> ({end_date_str})\n\n"
+                            "🔥 <b>Сейчас действует скидка!</b>\n"
+                            "Успей продлить подписку сейчас и получи выгодную цену.\n\n"
+                            "Не упусти возможность продолжить пользоваться VPN по специальной цене! 🎁"
+                        ),
+                        reply_markup=builder.as_markup(),
+                        parse_mode="HTML"
+                    )
+                    
+                    logger.info(f"Sent subscription reminder to user {user_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to send reminder to user {user_id}: {e}")
+            
+            logger.info(f"Subscription reminders completed: {len(users_to_remind)} users notified")
+    
+    except Exception as e:
+        logger.error(f"Error in send_subscription_reminder: {e}")
+
+@dp.callback_query(F.data.startswith("feedback_rating:"))
+async def handle_feedback_rating(callback: CallbackQuery):
+    """Обработчик рейтинга от пользователя"""
+    user_id = callback.from_user.id
+    parts = callback.data.split(":")
+    rating = int(parts[1])
+    payment_id = int(parts[2]) if len(parts) > 2 else 0
+    
+    try:
+        # Сохраняем рейтинг в БД
+        with get_connection(cfg.database.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Проверяем, существует ли таблица feedback_ratings
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS feedback_ratings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    payment_id INTEGER,
+                    rating INTEGER,
+                    timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Сохраняем рейтинг
+            cursor.execute('''
+                INSERT INTO feedback_ratings (user_id, payment_id, rating)
+                VALUES (?, ?, ?)
+            ''', (user_id, payment_id if payment_id > 0 else None, rating))
+            conn.commit()
+        
+        # Отправляем благодарность
+        await callback.message.edit_text(
+            f"🙏 <b>Спасибо за отзыв!</b>\n\n"
+            f"Вы оценили наш VPN на <b>{'⭐' * rating}</b>\n\n"
+            "Ваше мнение очень важно для нас!",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        
+        # Отправляем результат админу
+        user_info = f"@{callback.from_user.username}" if callback.from_user.username else f"ID: {user_id}"
+        user_name = callback.from_user.first_name or "Пользователь"
+        
+        for admin_id in cfg.bot.admin_ids:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        f"⭐ <b>Новый отзыв о VPN</b>\n\n"
+                        f"Пользователь: {user_name} ({user_info})\n"
+                        f"Рейтинг: <b>{'⭐' * rating}</b> ({rating}/5)\n"
+                        f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send feedback to admin {admin_id}: {e}")
+        
+    except Exception as e:
+        logger.error(f"Error handling feedback rating: {e}")
+        await callback.answer("❌ Ошибка при сохранении отзыва", show_alert=True)
+
 async def daily_scheduler():
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(
@@ -2115,6 +2321,22 @@ async def daily_scheduler():
         'cron',
         hour=12,
         minute=5,
+        args=[cfg.database.db_path]
+    )
+    # Отправка опросов через 3 дня после покупки в 12:10
+    scheduler.add_job(
+        send_feedback_request,
+        'cron',
+        hour=12,
+        minute=10,
+        args=[cfg.database.db_path]
+    )
+    # Напоминания о подписке за 3 дня до окончания в 12:15
+    scheduler.add_job(
+        send_subscription_reminder,
+        'cron',
+        hour=12,
+        minute=15,
         args=[cfg.database.db_path]
     )
     scheduler.start()

@@ -87,6 +87,18 @@ def init_db(db_path: str = DATABASE_FILE):
         ''')
         
         cursor.execute('''
+            CREATE TABLE IF NOT EXISTS feedback_ratings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                payment_id INTEGER,
+                rating INTEGER,
+                timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(user_id),
+                FOREIGN KEY(payment_id) REFERENCES payments(id)
+            )
+        ''')
+        
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS servers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
