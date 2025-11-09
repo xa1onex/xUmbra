@@ -2460,8 +2460,8 @@ async def daily_scheduler():
     scheduler.add_job(
         sync_subscriptions_and_keys,
         'cron',
-        hour=12,
-        minute=5,
+        hour=11,
+        minute=43,
         args=[cfg.database.db_path]
     )
     # Отправка опросов через 3 дня после покупки в 12:10
