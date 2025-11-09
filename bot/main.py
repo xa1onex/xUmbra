@@ -2453,7 +2453,7 @@ async def daily_scheduler():
         check_expired_subscriptions,
         'cron',
         hour=11,
-        minute=30,
+        minute=35,
         args=[cfg.database.db_path]
     )
     # Синхронизация подписок и ключей раз в день в 12:05
