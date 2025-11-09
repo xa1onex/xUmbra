@@ -124,6 +124,7 @@ class AddServerSteps(StatesGroup):
 
 class AdminEditStates(StatesGroup):
     EDIT_ANNOUNCEMENT = State()
+    TEST_FEEDBACK_USERNAME = State()
 
 class KeyManagementStates(StatesGroup):
     CHOOSING_SERVER_FOR_KEY = State()
@@ -175,6 +176,10 @@ def get_main_keyboard(user_id: int):
     builder = InlineKeyboardBuilder()
     if is_admin(user_id):
         builder.row(InlineKeyboardButton(text="✏️ Редактировать объявление", callback_data="edit_announcement"))
+        builder.row(
+            InlineKeyboardButton(text="🧪 Тест напоминания", callback_data="admin_test_reminder"),
+            InlineKeyboardButton(text="🧪 Тест опроса", callback_data="admin_test_feedback")
+        )
     builder.row(
         InlineKeyboardButton(text="💳 Premium", callback_data="open_premium"),
         InlineKeyboardButton(text="🎁 Рефералка", callback_data="open_invite")
@@ -185,8 +190,6 @@ def get_main_keyboard(user_id: int):
     builder.row(
         InlineKeyboardButton(text="🆘 Помощь", callback_data="open_help")
     )
-    if is_admin(user_id):
-        builder.row(InlineKeyboardButton(text="✏️ Редактировать объявление", callback_data="edit_announcement"))
     return builder.as_markup()
 
 def get_subscription_status(user_id: int) -> str:
@@ -1088,6 +1091,179 @@ async def save_announcement_text(message: Message, state: FSMContext):
     set_announcement_text(new_ann)
     await message.answer("✅ Объявление обновлено! Теперь оно показывается всем пользователям.", parse_mode="HTML")
     await state.clear()
+
+@dp.callback_query(F.data == "admin_test_reminder")
+async def handle_admin_test_reminder(callback: CallbackQuery):
+    """Тест напоминания о подписке для админа"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    
+    user_id = callback.from_user.id
+    
+    try:
+        # Проверяем подписку админа
+        with get_connection(cfg.database.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT subscription_end, pay_subscribed
+                FROM users
+                WHERE user_id = ?
+            ''', (user_id,))
+            result = cursor.fetchone()
+            
+            if not result or not result[0]:
+                await callback.answer("❌ У вас нет подписки для теста", show_alert=True)
+                return
+            
+            subscription_end, pay_subscribed = result[0], result[1]
+            
+            if pay_subscribed != 1:
+                await callback.answer("❌ У вас нет активной подписки для теста", show_alert=True)
+                return
+            
+            # Парсим дату окончания
+            try:
+                if isinstance(subscription_end, str):
+                    if ' ' in subscription_end:
+                        end_date = datetime.strptime(subscription_end.split()[0], "%Y-%m-%d")
+                    else:
+                        end_date = datetime.strptime(subscription_end, "%Y-%m-%d")
+                else:
+                    end_date = subscription_end
+                
+                # Вычисляем количество дней до окончания
+                days_remaining = (end_date - datetime.now()).days
+                
+                if days_remaining > 3:
+                    await callback.answer(
+                        f"ℹ️ У вас осталось {days_remaining} дней до окончания подписки. "
+                        "Напоминание отправляется только если осталось 3 дня или меньше.",
+                        show_alert=True
+                    )
+                    return
+                
+                # Форматируем дату окончания
+                end_date_str = end_date.strftime("%d.%m.%Y")
+                
+                # Отправляем напоминание
+                builder = InlineKeyboardBuilder()
+                builder.row(InlineKeyboardButton(text="💎 Продлить подписку", callback_data="open_premium"))
+                builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
+                
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        "⏰ <b>Напоминание о подписке</b>\n\n"
+                        f"Ваша VPN подписка истекает <b>через {days_remaining} дней</b> ({end_date_str})\n\n"
+                        "🔥 <b>Сейчас действует скидка!</b>\n"
+                        "Успей продлить подписку сейчас и получи выгодную цену.\n\n"
+                        "Не упусти возможность продолжить пользоваться VPN по специальной цене! 🎁"
+                    ),
+                    reply_markup=builder.as_markup(),
+                    parse_mode="HTML"
+                )
+                
+                await callback.answer("✅ Тестовое напоминание отправлено!")
+                
+            except Exception as e:
+                logger.error(f"Error parsing subscription date: {e}")
+                await callback.answer("❌ Ошибка при проверке подписки", show_alert=True)
+    
+    except Exception as e:
+        logger.error(f"Error in admin_test_reminder: {e}")
+        await callback.answer("❌ Ошибка при отправке тестового напоминания", show_alert=True)
+
+@dp.callback_query(F.data == "admin_test_feedback")
+async def handle_admin_test_feedback(callback: CallbackQuery, state: FSMContext):
+    """Тест опроса - запрос username"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "🧪 <b>Тест опроса</b>\n\n"
+        "Введите @username пользователя, которому хотите отправить тестовый опрос:",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminEditStates.TEST_FEEDBACK_USERNAME)
+    await callback.answer()
+
+@dp.message(AdminEditStates.TEST_FEEDBACK_USERNAME)
+async def handle_test_feedback_username(message: Message, state: FSMContext):
+    """Обработка username для тестового опроса"""
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав", parse_mode="HTML")
+        await state.clear()
+        return
+    
+    username = message.text.strip()
+    
+    # Убираем @ если есть
+    if username.startswith('@'):
+        username = username[1:]
+    
+    try:
+        # Ищем пользователя по username
+        with get_connection(cfg.database.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT user_id, first_name, username
+                FROM users
+                WHERE username = ? OR username = ?
+            ''', (username, f"@{username}"))
+            user_data = cursor.fetchone()
+            
+            if not user_data:
+                await message.answer(
+                    f"❌ Пользователь с username <code>@{username}</code> не найден в базе данных.",
+                    parse_mode="HTML"
+                )
+                await state.clear()
+                return
+            
+            target_user_id, first_name, db_username = user_data
+            
+            # Получаем последний платеж пользователя (или создаем фиктивный ID)
+            cursor.execute('''
+                SELECT id FROM payments
+                WHERE user_id = ? AND status = 'completed'
+                ORDER BY id DESC LIMIT 1
+            ''', (target_user_id,))
+            payment_result = cursor.fetchone()
+            payment_id = payment_result[0] if payment_result else 0
+            
+            # Отправляем опрос
+            builder = InlineKeyboardBuilder()
+            for rating in range(1, 6):
+                builder.row(InlineKeyboardButton(
+                    text="⭐" * rating,
+                    callback_data=f"feedback_rating:{rating}:{payment_id}"
+                ))
+            
+            await bot.send_message(
+                chat_id=target_user_id,
+                text=(
+                    "👋 Привет! Как тебе наш VPN?\n\n"
+                    "Поделись своим мнением, это поможет нам стать лучше!"
+                ),
+                reply_markup=builder.as_markup(),
+                parse_mode="HTML"
+            )
+            
+            await message.answer(
+                f"✅ Тестовый опрос отправлен пользователю <b>{first_name}</b> (@{db_username or username})",
+                parse_mode="HTML"
+            )
+            await state.clear()
+    
+    except Exception as e:
+        logger.error(f"Error sending test feedback: {e}")
+        await message.answer(
+            f"❌ Ошибка при отправке тестового опроса: {str(e)}",
+            parse_mode="HTML"
+        )
+        await state.clear()
 
 def is_admin(user_id: int) -> bool:
     """Проверка, является ли пользователь админом"""
