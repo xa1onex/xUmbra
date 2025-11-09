@@ -2452,8 +2452,8 @@ async def daily_scheduler():
     scheduler.add_job(
         check_expired_subscriptions,
         'cron',
-        hour=12,
-        minute=0,
+        hour=11,
+        minute=30,
         args=[cfg.database.db_path]
     )
     # Синхронизация подписок и ключей раз в день в 12:05
