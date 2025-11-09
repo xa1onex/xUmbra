@@ -194,19 +194,39 @@ def get_main_keyboard(user_id: int):
 
 def get_subscription_status(user_id: int) -> str:
     """Получает статус подписки пользователя"""
-    with get_connection(cfg.database.db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT subscription_end, pay_subscribed 
-            FROM users 
-            WHERE user_id = ?
-        ''', (user_id,))
-        user_data = cursor.fetchone()
+    try:
+        with get_connection(cfg.database.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT subscription_end, pay_subscribed 
+                FROM users 
+                WHERE user_id = ?
+            ''', (user_id,))
+            user_data = cursor.fetchone()
 
-        if user_data and user_data[1] == 1 and user_data[0]:
-            end_date = datetime.strptime(user_data[0], "%Y-%m-%d")
-            if end_date >= datetime.now():
-                return f"активен до {end_date.strftime('%d.%m.%Y')}"
+            if user_data and user_data[1] == 1 and user_data[0]:
+                try:
+                    subscription_end = user_data[0]
+                    # Парсим дату с учетом возможного формата с временем
+                    if isinstance(subscription_end, str):
+                        if ' ' in subscription_end:
+                            end_date = datetime.strptime(subscription_end.split()[0], "%Y-%m-%d")
+                        else:
+                            end_date = datetime.strptime(subscription_end, "%Y-%m-%d")
+                    else:
+                        end_date = subscription_end
+                    
+                    # Сравниваем только даты
+                    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                    end_date_only = end_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                    
+                    if end_date_only >= today:
+                        return f"активен до {end_date.strftime('%d.%m.%Y')}"
+                except Exception as e:
+                    logger.error(f"Error parsing subscription date in get_subscription_status: {e}, date: {user_data[0]}")
+                    return "неактивен"
+    except Exception as e:
+        logger.error(f"Error in get_subscription_status: {e}")
     return "неактивен"
 
 def get_main_text(first_name: str, subscription_status: str, user_id: int = None) -> str:
@@ -443,8 +463,8 @@ async def _build_subscription_message(info: dict, state: FSMContext):
     
     if is_active:
         # Если подписка активна - показываем информацию и VPN ссылку
-        # Форматируем дни: если < 1, то "<1"
-        days_display = "<1" if days_remaining < 1 else str(days_remaining)
+        # Форматируем дни: если < 1, то "<1" (используем HTML-сущность)
+        days_display = "&lt;1" if days_remaining < 1 else str(days_remaining)
         text = (
             "✅ Ваш <b>VPN</b> <b>активен</b>!\n\n"
             f"📅 Дата окончания: <i>{end_date_str}</i>\n"
@@ -1303,22 +1323,39 @@ def get_server_by_id(server_id: int):
 
 def check_user_subscription(user_id: int) -> bool:
     """Проверка, есть ли у пользователя активная подписка"""
-    with get_connection(cfg.database.db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT pay_subscribed, subscription_end 
-            FROM users 
-            WHERE user_id = ?
-        ''', (user_id,))
-        result = cursor.fetchone()
-        if not result or result[0] != 1:
-            return False
-        if result[1]:
-            try:
-                end_date = datetime.strptime(result[1], "%Y-%m-%d")
-                return end_date >= datetime.now()
-            except:
+    try:
+        with get_connection(cfg.database.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT pay_subscribed, subscription_end 
+                FROM users 
+                WHERE user_id = ?
+            ''', (user_id,))
+            result = cursor.fetchone()
+            if not result or result[0] != 1:
                 return False
+            if result[1]:
+                try:
+                    subscription_end = result[1]
+                    # Парсим дату с учетом возможного формата с временем
+                    if isinstance(subscription_end, str):
+                        if ' ' in subscription_end:
+                            end_date = datetime.strptime(subscription_end.split()[0], "%Y-%m-%d")
+                        else:
+                            end_date = datetime.strptime(subscription_end, "%Y-%m-%d")
+                    else:
+                        end_date = subscription_end
+                    
+                    # Сравниваем только даты
+                    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                    end_date_only = end_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                    return end_date_only >= today
+                except Exception as e:
+                    logger.error(f"Error parsing subscription date in check_user_subscription: {e}, date: {result[1]}")
+                    return False
+            return False
+    except Exception as e:
+        logger.error(f"Error in check_user_subscription: {e}")
         return False
 
 def get_user_keys_count(user_id: int) -> int:
