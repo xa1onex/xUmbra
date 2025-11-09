@@ -572,7 +572,7 @@ async def handle_sub_info(callback: CallbackQuery, state: FSMContext):
     """Обертка для обратной совместимости - вызывает callback обработчик"""
     await handle_open_premium_callback(callback, state)
 
-@dp.callback_query(SubscriptionSteps.CHOOSING_PLAN, F.data.startswith("plan:"))
+@dp.callback_query(F.data.startswith("plan:"))
 async def select_plan(callback: CallbackQuery, state: FSMContext):
     plan_id = callback.data.split(":")[1]
     user_id = callback.from_user.id
@@ -625,6 +625,11 @@ async def select_plan(callback: CallbackQuery, state: FSMContext):
             await handle_open_premium_callback(callback, state)
             return
 
+    # Устанавливаем состояние FSM, если его еще нет
+    current_state = await state.get_state()
+    if current_state is None:
+        await state.set_state(SubscriptionSteps.CHOOSING_PLAN)
+    
     await state.update_data(
         selected_plan_id=plan_id,
         selected_plan_data=plan_data,
