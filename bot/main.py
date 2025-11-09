@@ -443,10 +443,12 @@ async def _build_subscription_message(info: dict, state: FSMContext):
     
     if is_active:
         # Если подписка активна - показываем информацию и VPN ссылку
+        # Форматируем дни: если < 1, то "<1"
+        days_display = "<1" if days_remaining < 1 else str(days_remaining)
         text = (
             "✅ Ваш <b>VPN</b> <b>активен</b>!\n\n"
             f"📅 Дата окончания: <i>{end_date_str}</i>\n"
-            f"⏰ Осталось дней: <i>{days_remaining}</i>\n\n"
+            f"⏰ Осталось дней: <i>{days_display}</i>\n\n"
         )
         
         # Показываем VPN ссылку если она есть
@@ -1134,10 +1136,11 @@ async def handle_admin_test_reminder(callback: CallbackQuery):
                 
                 # Вычисляем количество дней до окончания
                 days_remaining = (end_date - datetime.now()).days
+                days_display = "<1" if days_remaining < 1 else str(days_remaining)
                 
                 if days_remaining > 3:
                     await callback.answer(
-                        f"ℹ️ У вас осталось {days_remaining} дней до окончания подписки. "
+                        f"ℹ️ У вас осталось {days_display} дней до окончания подписки. "
                         "Напоминание отправляется только если осталось 3 дня или меньше.",
                         show_alert=True
                     )
@@ -1146,16 +1149,20 @@ async def handle_admin_test_reminder(callback: CallbackQuery):
                 # Форматируем дату окончания
                 end_date_str = end_date.strftime("%d.%m.%Y")
                 
-                # Отправляем напоминание
+                # Формируем кнопки для покупки подписки
                 builder = InlineKeyboardBuilder()
-                builder.row(InlineKeyboardButton(text="💎 Продлить подписку", callback_data="open_premium"))
+                for plan_id, plan_data in SUBSCRIPTION_PLANS.items():
+                    builder.row(InlineKeyboardButton(
+                        text=f"{plan_data['title']} - {plan_data['price_rub'] // 100}₽",
+                        callback_data=f"plan:{plan_id}"
+                    ))
                 builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
                 
                 await bot.send_message(
                     chat_id=user_id,
                     text=(
                         "⏰ <b>Напоминание о подписке</b>\n\n"
-                        f"Ваша VPN подписка истекает <b>через {days_remaining} дней</b> ({end_date_str})\n\n"
+                        f"Ваша VPN подписка истекает <b>через {days_display} дней</b> ({end_date_str})\n\n"
                         "🔥 <b>Сейчас действует скидка!</b>\n"
                         "Успей продлить подписку сейчас и получи выгодную цену.\n\n"
                         "Не упусти возможность продолжить пользоваться VPN по специальной цене! 🎁"
@@ -1233,13 +1240,15 @@ async def handle_test_feedback_username(message: Message, state: FSMContext):
             payment_result = cursor.fetchone()
             payment_id = payment_result[0] if payment_result else 0
             
-            # Отправляем опрос
+            # Отправляем опрос - кнопки в строку с цифрами 1-5
             builder = InlineKeyboardBuilder()
+            buttons = []
             for rating in range(1, 6):
-                builder.row(InlineKeyboardButton(
-                    text="⭐" * rating,
+                buttons.append(InlineKeyboardButton(
+                    text=str(rating),
                     callback_data=f"feedback_rating:{rating}:{payment_id}"
                 ))
+            builder.row(*buttons)
             
             await bot.send_message(
                 chat_id=target_user_id,
@@ -2334,13 +2343,15 @@ async def send_feedback_request(db_path: str):
                     payment_result = cursor.fetchone()
                     payment_id = payment_result[0] if payment_result else None
                     
-                    # Отправляем опрос
+                    # Отправляем опрос - кнопки в строку с цифрами 1-5
                     builder = InlineKeyboardBuilder()
+                    buttons = []
                     for rating in range(1, 6):
-                        builder.row(InlineKeyboardButton(
-                            text="⭐" * rating,
+                        buttons.append(InlineKeyboardButton(
+                            text=str(rating),
                             callback_data=f"feedback_rating:{rating}:{payment_id or 0}"
                         ))
+                    builder.row(*buttons)
                     
                     await bot.send_message(
                         chat_id=user_id,
@@ -2389,18 +2400,27 @@ async def send_subscription_reminder(db_path: str):
                         else:
                             end_date = subscription_end
                         end_date_str = end_date.strftime("%d.%m.%Y")
+                        # Вычисляем количество дней до окончания
+                        days_remaining = (end_date - datetime.now()).days
+                        days_display = "<1" if days_remaining < 1 else str(days_remaining)
                     except:
                         end_date_str = subscription_end
+                        days_display = "?"
                     
+                    # Формируем кнопки для покупки подписки
                     builder = InlineKeyboardBuilder()
-                    builder.row(InlineKeyboardButton(text="💎 Продлить подписку", callback_data="open_premium"))
+                    for plan_id, plan_data in SUBSCRIPTION_PLANS.items():
+                        builder.row(InlineKeyboardButton(
+                            text=f"{plan_data['title']} - {plan_data['price_rub'] // 100}₽",
+                            callback_data=f"plan:{plan_id}"
+                        ))
                     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
                     
                     await bot.send_message(
                         chat_id=user_id,
                         text=(
                             "⏰ <b>Напоминание о подписке</b>\n\n"
-                            f"Ваша VPN подписка истекает <b>через 3 дня</b> ({end_date_str})\n\n"
+                            f"Ваша VPN подписка истекает <b>через {days_display} дней</b> ({end_date_str})\n\n"
                             "🔥 <b>Сейчас действует скидка!</b>\n"
                             "Успей продлить подписку сейчас и получи выгодную цену.\n\n"
                             "Не упусти возможность продолжить пользоваться VPN по специальной цене! 🎁"
