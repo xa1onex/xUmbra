@@ -1156,11 +1156,13 @@ async def handle_admin_test_reminder(callback: CallbackQuery):
                 
                 # Вычисляем количество дней до окончания
                 days_remaining = (end_date - datetime.now()).days
-                days_display = "<1" if days_remaining < 1 else str(days_remaining)
+                days_display = "&lt;1" if days_remaining < 1 else str(days_remaining)
                 
                 if days_remaining > 3:
+                    # В callback.answer не используем HTML, поэтому заменяем &lt; на <
+                    days_display_plain = "<1" if days_remaining < 1 else str(days_remaining)
                     await callback.answer(
-                        f"ℹ️ У вас осталось {days_display} дней до окончания подписки. "
+                        f"ℹ️ У вас осталось {days_display_plain} дней до окончания подписки. "
                         "Напоминание отправляется только если осталось 3 дня или меньше.",
                         show_alert=True
                     )
@@ -2439,7 +2441,7 @@ async def send_subscription_reminder(db_path: str):
                         end_date_str = end_date.strftime("%d.%m.%Y")
                         # Вычисляем количество дней до окончания
                         days_remaining = (end_date - datetime.now()).days
-                        days_display = "<1" if days_remaining < 1 else str(days_remaining)
+                        days_display = "&lt;1" if days_remaining < 1 else str(days_remaining)
                     except:
                         end_date_str = subscription_end
                         days_display = "?"
