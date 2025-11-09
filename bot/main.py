@@ -636,71 +636,12 @@ async def select_plan(callback: CallbackQuery, state: FSMContext):
         is_renewal=is_renewal
     )
     
-    # Проверяем, есть ли активные серверы
-    active_servers = get_active_servers()
-    if not active_servers:
-        await callback.answer("❌ Нет доступных серверов. Обратитесь к администратору.", show_alert=True)
-        return
-    
-    # Если это продление и у пользователя уже есть сервер - используем его
-    if is_renewal:
-        with get_connection(cfg.database.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT server_id FROM users WHERE user_id = ?', (user_id,))
-            result = cursor.fetchone()
-            if result and result[0]:
-                # Используем существующий сервер
-                server_id = result[0]
-                # Проверяем, что сервер активен
-                server_data = get_server_by_id(server_id)
-                if server_data and any(s[0] == server_id for s in active_servers):
-                    await state.update_data(selected_server_id=server_id)
-                    # Переходим к выбору метода оплаты
-                    await show_payment_methods(callback, state)
-                    return
-    
-    # Показываем выбор сервера
-    builder = InlineKeyboardBuilder()
-    text = f"🖥️ <b>Выберите сервер</b>\n\n"
-    text += f"План: <b>{plan_data['title']}</b>\n"
-    text += f"Цена: {plan_data['price_rub'] // 100}₽ | {plan_data['price_stars']}⭐\n\n"
-    text += "Выберите сервер для подключения:\n"
-    
-    for server_id, name, ip, _ in active_servers:
-        builder.button(
-            text=f"🖥️ {name} ({ip})",
-            callback_data=f"server:{server_id}"
-        )
-    builder.adjust(1)
-    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="sub_back_to_plan"))
-    
-    await callback.message.edit_text(
-        text,
-        reply_markup=builder.as_markup(),
-        parse_mode="HTML"
-    )
-    await state.set_state(SubscriptionSteps.CHOOSING_SERVER)
-    await callback.answer()
-
-@dp.callback_query(SubscriptionSteps.CHOOSING_SERVER, F.data.startswith("server:"))
-async def select_server(callback: CallbackQuery, state: FSMContext):
-    """Обработчик выбора сервера"""
-    server_id = int(callback.data.split(":")[1])
-    user_id = callback.from_user.id
-    
-    # Проверяем, что сервер активен
-    server_data = get_server_by_id(server_id)
-    if not server_data:
-        await callback.answer("❌ Сервер не найден", show_alert=True)
-        return
-    
-    active_servers = get_active_servers()
-    if not any(s[0] == server_id for s in active_servers):
-        await callback.answer("❌ Сервер неактивен", show_alert=True)
-        return
-    
-    await state.update_data(selected_server_id=server_id)
+    # Сразу переходим к выбору метода оплаты (без выбора сервера)
+    # Пользователь создаст ключ позже в разделе "Мои ключи"
     await show_payment_methods(callback, state)
+
+# Обработчик выбора сервера для подписки больше не используется
+# Пользователь создает ключи в разделе "Мои ключи" после покупки подписки
 
 async def show_payment_methods(callback: CallbackQuery, state: FSMContext):
     """Показать методы оплаты"""
@@ -741,19 +682,8 @@ async def process_payment(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Ошибка данных")
         return
 
-    # Получаем выбранный сервер из состояния
-    data = await state.get_data()
-    server_id = data.get('selected_server_id')
-    if not server_id:
-        # Если сервер не выбран, берем первый активный
-        active_servers = get_active_servers()
-        if active_servers:
-            server_id = active_servers[0][0]
-        else:
-            await callback.answer("❌ Нет доступных серверов", show_alert=True)
-            return
-
-    payload = f"{plan_id}|{method_id}|{server_id}"
+    # Не сохраняем server_id в payload - пользователь создаст ключ позже в разделе "Мои ключи"
+    payload = f"{plan_id}|{method_id}"
 
     currency_type = 'stars' if PAYMENT_METHODS[method_id]['currency'] == 'XTR' else 'rub'
     price = plan_data[f"price_{currency_type}"]
@@ -787,7 +717,6 @@ async def process_successful_payment(message: Message):
         # Обработка подписки
         plan_id = parts[0]
         method_id = parts[1]
-        server_id_from_payload = int(parts[2]) if len(parts) > 2 else None
 
         # Определение типа подписки
         if plan_id in SUBSCRIPTION_PLANS:
@@ -810,38 +739,8 @@ async def process_successful_payment(message: Message):
         user_id = message.from_user.id
         username = message.from_user.username or f"user_{user_id}"
         
-        # Получаем выбранный сервер
-        # Приоритет: из payload > из БД пользователя > первый активный
-        server_id = server_id_from_payload
-        if not server_id:
-            with get_connection(cfg.database.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT server_id FROM users WHERE user_id = ?', (user_id,))
-                result_user = cursor.fetchone()
-                server_id = result_user[0] if result_user and result_user[0] else None
-            
-            # Если сервер не найден, берем первый активный
-            if not server_id:
-                active_servers = get_active_servers()
-                if not active_servers:
-                    raise ValueError("Нет доступных серверов")
-                server_id = active_servers[0][0]
-        
-        # Получаем данные сервера
-        server_data = get_server_by_id(server_id)
-        if not server_data:
-            raise ValueError(f"Сервер {server_id} не найден")
-        
-        # Распаковываем данные сервера (может быть старый формат без port и protocol)
-        if len(server_data) >= 9:
-            server_id_db, server_name, server_ip, server_port, server_protocol, server_username, server_password, server_inbound_id, server_base_url = server_data
-        else:
-            # Старый формат (без port и protocol)
-            server_id_db, server_name, server_ip, server_username, server_password, server_inbound_id, server_base_url = server_data
-            server_port = 54321
-            server_protocol = 'https'
-        
         # Обновление подписки в базе данных (БЕЗ создания ключа)
+        # Пользователь создаст ключ позже в разделе "Мои ключи"
         with get_connection(cfg.database.db_path) as conn:
             cursor = conn.cursor()
 
