@@ -1171,13 +1171,14 @@ async def handle_admin_test_reminder(callback: CallbackQuery):
                 # Форматируем дату окончания
                 end_date_str = end_date.strftime("%d.%m.%Y")
                 
-                # Формируем кнопки для покупки подписки
+                # Формируем кнопки для продления подписки (как в меню премиум при остатке <= 3 дней)
                 builder = InlineKeyboardBuilder()
-                for plan_id, plan_data in SUBSCRIPTION_PLANS.items():
-                    builder.row(InlineKeyboardButton(
-                        text=f"{plan_data['title']} - {plan_data['price_rub'] // 100}₽",
+                for plan_id, plan_data in RENEWAL_PLANS.items():
+                    builder.button(
+                        text=f"{plan_data['title']} - {plan_data['price_rub'] // 100}₽ | {plan_data['price_stars']}⭐",
                         callback_data=f"plan:{plan_id}"
-                    ))
+                    )
+                builder.adjust(1)
                 builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
                 
                 await bot.send_message(
@@ -1262,12 +1263,12 @@ async def handle_test_feedback_username(message: Message, state: FSMContext):
             payment_result = cursor.fetchone()
             payment_id = payment_result[0] if payment_result else 0
             
-            # Отправляем опрос - кнопки в строку с цифрами 1-5
+            # Отправляем опрос - кнопки в строку с цифрами 1-5 и звездами
             builder = InlineKeyboardBuilder()
             buttons = []
             for rating in range(1, 6):
                 buttons.append(InlineKeyboardButton(
-                    text=str(rating),
+                    text=f"{rating} ⭐️",
                     callback_data=f"feedback_rating:{rating}:{payment_id}"
                 ))
             builder.row(*buttons)
@@ -2382,12 +2383,12 @@ async def send_feedback_request(db_path: str):
                     payment_result = cursor.fetchone()
                     payment_id = payment_result[0] if payment_result else None
                     
-                    # Отправляем опрос - кнопки в строку с цифрами 1-5
+                    # Отправляем опрос - кнопки в строку с цифрами 1-5 и звездами
                     builder = InlineKeyboardBuilder()
                     buttons = []
                     for rating in range(1, 6):
                         buttons.append(InlineKeyboardButton(
-                            text=str(rating),
+                            text=f"{rating} ⭐️",
                             callback_data=f"feedback_rating:{rating}:{payment_id or 0}"
                         ))
                     builder.row(*buttons)
@@ -2446,13 +2447,14 @@ async def send_subscription_reminder(db_path: str):
                         end_date_str = subscription_end
                         days_display = "?"
                     
-                    # Формируем кнопки для покупки подписки
+                    # Формируем кнопки для продления подписки (как в меню премиум при остатке <= 3 дней)
                     builder = InlineKeyboardBuilder()
-                    for plan_id, plan_data in SUBSCRIPTION_PLANS.items():
-                        builder.row(InlineKeyboardButton(
-                            text=f"{plan_data['title']} - {plan_data['price_rub'] // 100}₽",
+                    for plan_id, plan_data in RENEWAL_PLANS.items():
+                        builder.button(
+                            text=f"{plan_data['title']} - {plan_data['price_rub'] // 100}₽ | {plan_data['price_stars']}⭐",
                             callback_data=f"plan:{plan_id}"
-                        ))
+                        )
+                    builder.adjust(1)
                     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="go_back"))
                     
                     await bot.send_message(
